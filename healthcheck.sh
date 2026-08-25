@@ -18,4 +18,6 @@ fi
 # main app
 curl -sSf "http://$APP_HOST:$APP_PORT/heartbeat" > /dev/null
 
-# todo: vosk server
+# Nothing else to check. Upstream had a second process here (the Vosk server); this fork's only other
+# dependencies are Korsi and the speech provider, and neither belongs in a container healthcheck --
+# an unreachable Korsi is a reason to log and retry, not a reason to have Docker restart the bridge.

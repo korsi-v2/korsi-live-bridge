@@ -1,9 +1,15 @@
 # SPDX-FileCopyrightText: 2025 Nextcloud GmbH and Nextcloud contributors
+# SPDX-FileCopyrightText: 2026 Pishrun and Korsi contributors
 # SPDX-License-Identifier: AGPL-3.0-or-later
+
 version = 1
-SPDX-PackageName = "live_transcription"
-SPDX-PackageSupplier = "Nextcloud <info@nextcloud.com>"
-SPDX-PackageDownloadLocation = "https://github.com/nextcloud/live_transcription"
+SPDX-PackageName = "korsi_live_bridge"
+SPDX-PackageSupplier = "Korsi <info@korsi.ai>"
+SPDX-PackageDownloadLocation = "https://github.com/korsi-v2/korsi-live-bridge"
+
+# AGPL, unchanged and not by choice: this is a derivative of nextcloud/live_transcription, whose
+# licence requires it. ADR-0021 records the consequence -- the bridge is the one Korsi component whose
+# source has to be offered to the customers running it.
 
 [[annotations]]
 path = ["requirements.txt", "requirements_dev.txt"]

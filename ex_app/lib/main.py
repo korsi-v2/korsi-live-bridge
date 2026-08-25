@@ -1,29 +1,30 @@
-#
 # SPDX-FileCopyrightText: 2025 Nextcloud GmbH and Nextcloud contributors
+# SPDX-FileCopyrightText: 2026 Pishrun and Korsi contributors
 # SPDX-License-Identifier: AGPL-3.0-or-later
 #
+"""The ExApp entry point.
+
+**Almost no HTTP surface, and that is the design.** Upstream exposes routes for starting transcription,
+setting a room's language and listing translation languages, because Talk's PHP side drives it: a
+participant presses a button and Nextcloud tells the app what to do. This bridge is driven from the
+other end -- it asks Korsi which rooms to watch and notices calls itself -- so the only routes left are
+the two AppAPI requires and one an administrator needs to tell "working" from "silently doing nothing".
+
+The consequence worth stating: enabling this app in Nextcloud starts a background loop that talks to
+Korsi. Nothing in the Talk UI turns it on or off, because for Korsi's customers the recording is not
+an opt-in per meeting.
+"""
 
 import logging
 import os
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from pathlib import Path
 from threading import Event
 
 import urllib3
 
 # isort: off
-from livetypes import (
-	LanguageModel,
-	RoomLanguageSetRequest,
-	SpreedClientException,
-	SupportedTranslationLanguages,
-	TargetLanguageSetRequest,
-	TranscribeRequest,
-	TranslateFatalException,
-	TranslateLangPairException,
-	TranscriptTargetNotFoundException,
-	VoskException,
-)
+from livetypes import SpreedClientException
 from dotenv import load_dotenv
 load_dotenv()
 
@@ -35,35 +36,30 @@ if __skip_cert_verify in ("true", "1"):
 # isort: on
 
 import uvicorn
-from capabilities import get_supported_translation_languages
-from fastapi import Body, FastAPI
+from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 from fastapi.routing import APIRouter
 from logger import get_logging_config, setup_logging
-from meta_translator import MetaTranslator
-from models import VOSK_SUPPORTED_LANGUAGE_MAP
 from nc_py_api import AsyncNextcloudApp, NextcloudApp
-from nc_py_api.ex_app import AppAPIAuthMiddleware, persistent_storage, run_app, set_handlers, setup_nextcloud_logging
+from nc_py_api.ex_app import AppAPIAuthMiddleware, run_app, set_handlers, setup_nextcloud_logging
 from service import Application
-from utils import get_hpb_settings
+from utils import check_korsi_env_vars, get_hpb_settings
 
 LOGGER_CONFIG_NAME = "../../logger_config.yaml"
 LOGGER = logging.getLogger("lt")
 SERVICE: Application
 ENABLED = Event()
-MODELS_TO_FETCH = {
-	"Nextcloud-AI/vosk-models": {
-		"local_dir": persistent_storage(),
-		"revision": "06f2f156dcd79092400891afb6cf8101e54f6ba2",
-	}
-}
-# todo: declarative settings for language override and model download
+
+# No models to fetch. Upstream downloads Vosk models into persistent storage on install -- gigabytes
+# per language, on the customer's disk, with a pinned revision to keep in step. Speech happens at
+# Soniox under a key Korsi mints per session, so this container carries no model and needs no
+# persistent storage at all.
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
 	global SERVICE
-	set_handlers(app, enabled_handler, models_to_fetch=MODELS_TO_FETCH)
+	set_handlers(app, enabled_handler)
 	SERVICE = Application()
 	nc = NextcloudApp()
 	if nc.enabled_state:
@@ -72,13 +68,21 @@ async def lifespan(app: FastAPI):
 			SERVICE.hpb_settings = get_hpb_settings()
 		except Exception as e:
 			LOGGER.warning("Failed to get the HPB settings when app is enabled", exc_info=e)
+		try:
+			await SERVICE.start()
+		except Exception as e:
+			LOGGER.error("Could not start watching for calls on startup", exc_info=e)
 	LOGGER.info("App is %s on startup", "enabled" if ENABLED.is_set() else "disabled")
 	yield
+	# Closes the live sessions of any call in progress rather than leaving them for korsi-api's sweep.
+	with suppress(Exception):
+		await SERVICE.stop()
 
 
 APP = FastAPI(lifespan=lifespan)
 APP.add_middleware(AppAPIAuthMiddleware)  # set global AppAPI authentication middleware
 ROUTER_V1 = APIRouter(prefix="/api/v1", tags=["v1"])
+
 
 @APP.exception_handler(SpreedClientException)
 async def spreed_client_exception_handler(request, exc: SpreedClientException):
@@ -93,164 +97,19 @@ async def get_enabled():
 	return {"enabled": ENABLED.is_set()}
 
 
-@ROUTER_V1.post("/call/set-language",
-	responses={
-		200: {"description": "Language set successfully for the call"},
-		400: {"description": "Invalid or unsupported language ID provided."},
-		404: {"description": "Spreed client not found for the provided room token."},
-		500: {"description": "Failed to set language for the call."}
-	})
-async def set_call_language(req: RoomLanguageSetRequest):
-	try:
-		if not req.langId or req.langId not in VOSK_SUPPORTED_LANGUAGE_MAP:
-			return JSONResponse(
-				status_code=400,
-				content={"error": "Invalid or unsupported language ID provided."},
-			)
-		await SERVICE.set_call_language(req)
-		return JSONResponse(status_code=200, content={"message": "Language set successfully for the call"})
-	except VoskException as e:
-		LOGGER.exception("VoskException during set_call_language", exc_info=e)
-		return JSONResponse(status_code=e.retcode, content={"error": str(e)})
-	except SpreedClientException as e:
-		return JSONResponse(status_code=404, content={"error": str(e)})
-	except Exception as e:
-		LOGGER.exception("Exception during set_call_language", exc_info=e)
-		return JSONResponse(status_code=500, content={"error": "Failed to set language for the call"})
-
-
-# for translation
-@ROUTER_V1.get("/translation/languages", responses={
-		200: {"description": "Supported origin and target translation languages fetched successfully."},
-		500: {"description": "An error occurred while fetching supported origin and target translation languages."},
-		550: {"description": (
-			"A fatal error occurred while fetching supported origin and target translation languages."
-			" Do not retry any further attempts until the underlying issue is resolved."
-			" The translation provider may be not installed or misconfigured. See the logs for details."
-		)},
-	},
-	response_model=None,
+@ROUTER_V1.get("/status",
 	description=(
-		"Fetch supported origin and target translation languages."
-		' The origin language list can contain "detect_language" as a special value indicating auto-detection support.'
+		"Whether the bridge is watching for calls, and which rooms Korsi told it to watch."
+		" Read this to distinguish a working bridge waiting for a meeting from a misconfigured one."
 	),
+	responses={200: {"description": "Current state of the bridge."}},
 )
-async def get_translation_languages(roomToken: str) -> SupportedTranslationLanguages | JSONResponse:
-	try:
-		return await MetaTranslator.get_translation_languages()
-	except TranslateFatalException as e:
-		LOGGER.warning("TranslateFatalException during get_translation_languages", exc_info=e)
-		return JSONResponse(
-			status_code=550,
-			content={"error": "A fatal error occurred while fetching translation languages."},
-		)
-	except Exception as e:
-		LOGGER.exception("Exception during get_translation_languages", exc_info=e)
-		return JSONResponse(
-			status_code=500,
-			content={"error": "An error occurred while fetching translation languages."},
-		)
-
-
-# for translation
-@ROUTER_V1.post("/translation/set-target-language",
-	description=(
-		"Set the target translation language for a participant in a call."
-		" Set langId to null to disable translation for the participant."
-	),
-	responses={
-		200: {"description": "Target translation language set successfully for the participant."},
-		400: {"description": "Invalid, unsupported or same language ID provided as the origin language."},
-		404: {"description": "Spreed client not found for the provided room token."},
-		412: {"description": (
-			"The participant has not yet enabled transcription in the call,"
-			" which is required to receive translated text."
-		)},
-		500: {"description": "Failed to set the target translation language for the participant."},
-		550: {"description": (
-			"A fatal error occurred while setting the target translation language for the participant."
-			" Do not retry any further translation attempts until the underlying issue is resolved."
-			" The translation provider may be not installed or misconfigured. See the logs for details."
-		)},
-	})
-async def set_target_language(req: TargetLanguageSetRequest):
-	try:
-		await SERVICE.set_target_language(req)
-		return JSONResponse(
-			status_code=200,
-			content={"message": "Target translation language set successfully for the participant."},
-		)
-	except TranslateLangPairException as e:
-		return JSONResponse(status_code=400, content={"error": str(e)})
-	except SpreedClientException as e:
-		return JSONResponse(status_code=404, content={"error": str(e)})
-	except TranscriptTargetNotFoundException as e:
-		return JSONResponse(status_code=412, content={"error": str(e)})
-	except TranslateFatalException as e:
-		LOGGER.warning("TranslateFatalException during set_target_language", exc_info=e)
-		return JSONResponse(status_code=550, content={"error": str(e)})
-	except Exception as e:
-		LOGGER.exception("Exception during set_target_language", exc_info=e)
-		return JSONResponse(
-			status_code=500,
-			content={"error": "Failed to set the target translation language for the participant."},
-		)
-
-
-@ROUTER_V1.post("/call/leave")
-async def leave_call(roomToken: str = Body(embed=True)):
-	try:
-		await SERVICE.leave_call(roomToken)
-	except Exception as e:
-		LOGGER.exception("Exception during leave_call", exc_info=e)
-		return JSONResponse(
-			status_code=500,
-			content={"error": "Failed to process leave call request."},
-		)
-	return JSONResponse(status_code=200, content={"message": "Leave call request processed."})
-
-
-@ROUTER_V1.post("/call/transcribe",
-	description=(
-		"Start transcription for a participant in a call."
-		" If translationTargetLangId is provided, translation will also be enabled for the participant."
-	),
-	responses={
-		200: {"description": "Transcription or translation request processed successfully."},
-		400: {"description": "Invalid, unsupported or same language ID provided as the room language for translation."},
-		503: {"description": "Failed to connect to the signaling server."},
-		550: {"description": (
-			"A fatal error occurred while processing the transcription or translation request."
-			" Do not retry any further attempts until the underlying issue is resolved."
-			" The transcription or translation provider may be not installed or misconfigured."
-			" See the logs for details."
-		)},
-	})
-async def transcribe_call(req: TranscribeRequest):
-	try:
-		await SERVICE.transcript_req(req)
-		return JSONResponse(
-			status_code=200,
-			content={"message": "Transcription or translation request processed successfully."},
-		)
-	except TranslateLangPairException as e:
-		return JSONResponse(status_code=400, content={"error": str(e)})
-	except TranslateFatalException as e:
-		LOGGER.warning("TranslateFatalException during transcribe_call", exc_info=e)
-		return JSONResponse(status_code=550, content={"error": str(e)})
-	except SpreedClientException as e:
-		return JSONResponse(status_code=503, content={"error": str(e)})
-	except Exception as e:
-		LOGGER.exception("Exception during transcribe_call", exc_info=e)
-		return JSONResponse(
-			status_code=500,
-			content={"error": "Failed to process transcription or translation request."},
-		)
-
-
-@ROUTER_V1.get("/languages")
-def get_supported_languages() -> dict[str, LanguageModel]:
-	return VOSK_SUPPORTED_LANGUAGE_MAP
+async def get_status():
+	status = SERVICE.status()
+	status["enabled"] = ENABLED.is_set()
+	# Reports which variables are missing, never their values: two of them are secrets.
+	status["missing_configuration"] = check_korsi_env_vars()
+	return status
 
 
 APP.include_router(ROUTER_V1)
@@ -259,56 +118,58 @@ APP.include_router(ROUTER_V1)
 # until capabilities is supported in nc_py_api
 @APP.get("/capabilities")
 async def get_capabilities() -> dict[str, dict]:
-	try:
-		supported_translation_languages = await get_supported_translation_languages()
-	except Exception as e:
-		LOGGER.exception("Failed to get supported translation languages for capabilities", exc_info=e)
-		supported_translation_languages = None
+	"""What this app tells Nextcloud it can do.
 
+	Not `live_transcription`. Upstream advertises that so Talk offers a captions button, and this fork
+	has no captions to offer: the transcript goes to Korsi, and it is not shown in Talk at all. Claiming
+	the upstream capability would put a button in the Talk UI that does nothing.
+	"""
 	return {
 		f"{os.environ['APP_ID']}": {
 			"version": f"{os.environ['APP_VERSION']}",
-			"features": [
-				"live_transcription",
-				*(["live_translation"] if supported_translation_languages else []),
-			],
-			"live_transcription": {
-				"supported_languages": VOSK_SUPPORTED_LANGUAGE_MAP,
-			},
-			**({
-				"live_translation": {
-					"supported_translation_languages": supported_translation_languages,
-				},
-			} if supported_translation_languages else {}),
+			"features": ["korsi_live_meeting_bridge"],
 		}
 	}
 
 
 def enabled_handler(enabled: bool, nc: NextcloudApp | AsyncNextcloudApp) -> str:
+	"""Nextcloud turned the app on or off.
+
+	Returning a non-empty string makes Nextcloud refuse to enable the app and show the reason, which is
+	the right behaviour for missing configuration: an app that enables successfully and then cannot
+	reach Korsi looks installed and is not working.
+	"""
 	print(f"enabled={enabled}", flush=True)
-	if enabled:
-		ENABLED.set()
-		try:
-			SERVICE.hpb_settings = get_hpb_settings()
-		except Exception as e:
-			LOGGER.warning("Failed to get the HPB settings when app is enabled", exc_info=e)
-	else:
+	if not enabled:
 		ENABLED.clear()
+		return ""
+
+	missing = check_korsi_env_vars()
+	if missing:
+		return (
+			"Korsi is not configured. Set these deploy options and try again: " + ", ".join(missing)
+		)
+
+	ENABLED.set()
+	try:
+		SERVICE.hpb_settings = get_hpb_settings()
+	except Exception as e:
+		LOGGER.warning("Failed to get the HPB settings when app is enabled", exc_info=e)
+		return (
+			"Could not read Nextcloud Talk's signaling settings. Talk needs a High Performance"
+			" Backend configured before this bridge can listen to calls."
+		)
 	return ""
 
 
 if __name__ == "__main__":
 	os.chdir(Path(__file__).parent)
-
 	logging_config = get_logging_config(LOGGER_CONFIG_NAME)
 	setup_logging(logging_config)
 	setup_nextcloud_logging("lt", logging.WARNING)
-
 	uv_log_config = uvicorn.config.LOGGING_CONFIG  # pyright: ignore[reportAttributeAccessIssue]
 	uv_log_config["formatters"]["json"] = logging_config["formatters"]["json"]
 	uv_log_config["handlers"]["file_json"] = logging_config["handlers"]["file_json"]
-
 	uv_log_config["loggers"]["uvicorn"]["handlers"].append("file_json")
 	uv_log_config["loggers"]["uvicorn.access"]["handlers"].append("file_json")
-
 	run_app("main:APP", log_level="info")

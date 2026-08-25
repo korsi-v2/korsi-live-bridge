@@ -8,6 +8,33 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](http://keepachangelog.com/)
 and this project adheres to [Semantic Versioning](http://semver.org/).
 
+## 1.0.0 - Korsi Live Meeting Bridge
+
+Forked from `nextcloud/live_transcription` 2.1.3 and repurposed: instead of showing captions to the
+participants who ask for them, the app reads calls in rooms Korsi tracks and posts the transcript to
+Korsi for live analysis. `readme.md` lists the differences; ADR-0021 records why.
+
+Version numbering restarts, because this is not a continuation of upstream's releases. Upstream's
+history below is kept: it is where the WebRTC and signaling code came from.
+
+### Changed
+- Calls are joined because Korsi's watchlist names the room, not because a viewer enabled captions.
+- One mixed mono stream per call through Soniox, replacing one Vosk connection per speaker.
+- Audio is resampled explicitly to mono s16 48 kHz instead of assuming the WebRTC decoder's output.
+- The speech connection is full duplex; the send/recv lock-step is gone.
+- `python:3.12-slim` base. No CUDA, no Kaldi, no Vosk build, no acoustic models, no persistent storage.
+
+### Removed
+- Translation, in all of its forms.
+- The captions capability and the routes that drove it, which have no counterpart here.
+- Speaker attribution, deliberately: a live reading is not the meeting's record.
+
+### Added
+- The Korsi API client, contract types, audio mixer, Soniox stream, segmenter and call watcher.
+- `GET /api/v1/status`, so an administrator can tell a working bridge from a misconfigured one.
+- Tests for the mixer's arithmetic, the segmenter's bookkeeping, and the request bodies against
+  korsi-api's generated OpenAPI document.
+
 ## 2.1.3 - 2026-08-19
 
 ### Changed

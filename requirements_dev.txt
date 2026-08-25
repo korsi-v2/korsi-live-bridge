@@ -1,6 +1,7 @@
 -r requirements.txt
-
 pre-commit
-black
 ruff
 mypy
+pytest
+pytest-asyncio
+jsonschema

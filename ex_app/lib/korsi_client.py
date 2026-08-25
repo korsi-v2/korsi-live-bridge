@@ -1,0 +1,314 @@
+#
+# SPDX-FileCopyrightText: 2026 Pishrun and Korsi contributors
+# SPDX-License-Identifier: AGPL-3.0-or-later
+#
+"""Everything this bridge says to korsi-api.
+
+Five calls out and no callbacks in, which is the whole shape of the integration: korsi-api never
+reaches into a customer's Nextcloud. Anything the bridge needs to know it asks for.
+
+**Why an OAuth2 machine user and not a shared secret.** korsi-api has three non-JWT planes already
+(`/internal/v1`, `/shared/v1`, `/management/v1`) and each is a separate thing to reason about when
+auditing who can reach what. A fourth one for this bridge would be a new security surface for a
+client that ZITADEL can already issue a perfectly ordinary token to, whose service-account role grants
+exactly `meeting.read` / `meeting.ingest` and nothing else. See ADR-0021 D4.
+
+**The scope string is configuration, not code.** The token has to be addressed to korsi-api's audience
+or the roles arrive in a claim korsi-api does not read, and expressing that means ZITADEL URN syntax
+(`urn:zitadel:iam:org:project:id:<id>:aud`). Building that here would put Korsi's identity-provider
+topology inside every customer's infrastructure, to be redeployed the day it changes. So Korsi's
+provisioning emits the finished string and the bridge pastes it into a token request. Section 2 of the
+design doc: the bridge holds no policy.
+"""
+
+import asyncio
+import logging
+import os
+from datetime import UTC, datetime
+from typing import Any
+
+import niquests
+from korsi_types import (
+	KorsiApiError,
+	LiveCloseReason,
+	LiveSegmentAccepted,
+	LiveSessionClosed,
+	LiveSessionDecision,
+	LiveSttCredential,
+	LiveWatchlist,
+)
+
+LOGGER = logging.getLogger("lt")
+
+#: Refresh a token this long before it expires. Long enough that no in-flight request dies of an
+#: expiry it was issued under, short enough that the bridge is not re-minting constantly.
+TOKEN_REFRESH_MARGIN_SECONDS = 60
+
+#: How long any single call to korsi-api may take. Generous because a segment POST enqueues an
+#: analysis job, and short enough that a hung API does not wedge the segment pump for a whole call.
+REQUEST_TIMEOUT_SECONDS = 30
+
+#: korsi-api error codes the bridge treats specially rather than as "some failure".
+_SESSION_GONE_CODES = frozenset({"live.session_closed", "live.session_not_found"})
+
+
+def _status_of(response: Any) -> int:
+	"""The response's status, treating "no status" as a failure rather than as a pass.
+
+	`niquests` types `status_code` as optional because a response object can exist for an exchange that
+	never completed. Comparing that against 400 with `>=` would let it through as success, so an
+	incomplete response would be handed to a JSON decoder as if the server had answered.
+	"""
+	status = getattr(response, "status_code", None)
+	return int(status) if status is not None else 599
+
+
+class KorsiClient:
+	"""An authenticated conversation with one Korsi tenant.
+
+	One instance per process. The token is shared across every call and every room, because it
+	identifies the *bridge*, not the call.
+	"""
+
+	def __init__(self) -> None:
+		self._base_url = os.environ["KORSI_API_URL"].rstrip("/")
+		self._token_url = os.environ["KORSI_TOKEN_URL"]
+		self._client_id = os.environ["KORSI_CLIENT_ID"]
+		self._client_secret = os.environ["KORSI_CLIENT_SECRET"]
+		self._scope = os.environ["KORSI_TOKEN_SCOPE"]
+
+		self._token: str | None = None
+		self._token_expires_at: float = 0.0
+		self._token_lock = asyncio.Lock()
+		self._session: niquests.AsyncSession | None = None
+
+	async def aclose(self) -> None:
+		if self._session is not None:
+			with_suppressed = self._session
+			self._session = None
+			try:
+				await with_suppressed.close()
+			except Exception as e:  # noqa: BLE001 - shutdown path, nothing to escalate to
+				LOGGER.debug("Error closing the Korsi HTTP session", exc_info=e, extra={"tag": "korsi"})
+
+	async def _http(self) -> niquests.AsyncSession:
+		if self._session is None:
+			self._session = niquests.AsyncSession()
+		return self._session
+
+	# ------------------------------------------------------------------ auth
+
+	async def _bearer(self) -> str:
+		"""A valid access token, minting one if the cached token is gone or nearly expired.
+
+		Under a lock because the segment pump, the watchlist poll and a credential renewal can all
+		notice the expiry in the same tick, and three simultaneous `client_credentials` grants for
+		one machine user is how a bridge gets itself rate-limited by the identity provider.
+		"""
+		async with self._token_lock:
+			now = asyncio.get_running_loop().time()
+			if self._token and now < self._token_expires_at - TOKEN_REFRESH_MARGIN_SECONDS:
+				return self._token
+
+			http = await self._http()
+			try:
+				response = await http.post(
+					self._token_url,
+					data={
+						"grant_type": "client_credentials",
+						"client_id": self._client_id,
+						"client_secret": self._client_secret,
+						"scope": self._scope,
+					},
+					headers={"Content-Type": "application/x-www-form-urlencoded"},
+					timeout=REQUEST_TIMEOUT_SECONDS,
+				)
+			except Exception as e:
+				raise KorsiApiError(f"could not reach the token endpoint: {e}") from e
+
+			status = _status_of(response)
+			if status >= 400:
+				# Deliberately not logging the body: a failed client_credentials response can echo
+				# the request, and the request carries the client secret.
+				raise KorsiApiError(f"token request rejected with {status}", status=status)
+
+			payload = response.json()
+			token = payload.get("access_token")
+			if not token:
+				raise KorsiApiError("token response carried no access_token")
+
+			self._token = str(token)
+			# Default to a short life when the provider does not say: a token treated as longer-lived
+			# than it is produces 401s in the middle of a call, which is the worst time to find out.
+			self._token_expires_at = now + float(payload.get("expires_in") or 300)
+			LOGGER.info("Minted a Korsi access token", extra={
+				"expires_in": payload.get("expires_in"),
+				"tag": "korsi",
+			})
+			return self._token
+
+	def forget_token(self) -> None:
+		"""Drop the cached token so the next call mints a fresh one.
+
+		Called when korsi-api answers 401 with a token this bridge believed was valid, which happens
+		legitimately: a key rotation, or a clock difference that made the local expiry optimistic.
+		"""
+		self._token = None
+		self._token_expires_at = 0.0
+
+	# ------------------------------------------------------------------ transport
+
+	async def _request(
+		self,
+		method: str,
+		path: str,
+		*,
+		json_body: dict[str, Any] | None = None,
+		retry_auth: bool = True,
+	) -> dict[str, Any]:
+		"""One call to korsi-api, with the 401 retry that token caching makes necessary.
+
+		Exactly one retry, and only for 401. Anything else is returned to the caller to decide
+		about -- retry policy for a segment is not the same as for a watchlist poll, and this layer
+		does not know which one it is serving.
+		"""
+		token = await self._bearer()
+		http = await self._http()
+		url = f"{self._base_url}{path}"
+
+		try:
+			response = await http.request(
+				method,
+				url,
+				json=json_body,
+				headers={
+					"Authorization": f"Bearer {token}",
+					"Accept": "application/json",
+				},
+				timeout=REQUEST_TIMEOUT_SECONDS,
+			)
+		except Exception as e:
+			raise KorsiApiError(f"{method} {path} failed to reach korsi-api: {e}") from e
+
+		status = _status_of(response)
+		if status == 401 and retry_auth:
+			LOGGER.info("Korsi rejected the token, re-minting once", extra={"path": path, "tag": "korsi"})
+			self.forget_token()
+			return await self._request(method, path, json_body=json_body, retry_auth=False)
+
+		if status >= 400:
+			raise self._problem_to_error(response, status, method=method, path=path)
+
+		if not response.content:
+			return {}
+		parsed = response.json()
+		return parsed if isinstance(parsed, dict) else {}
+
+	@staticmethod
+	def _problem_to_error(response: Any, status: int, *, method: str, path: str) -> KorsiApiError:
+		"""Turn korsi-api's `application/problem+json` into the right local exception.
+
+		The `code` matters more than the status: `live.session_closed` arrives as a 409, and 409 on
+		its own would read as "conflict, try again" when the correct response is to stop transcribing
+		this call.
+		"""
+		code = ""
+		title = ""
+		try:
+			problem = response.json()
+			if isinstance(problem, dict):
+				code = str(problem.get("code", ""))
+				title = str(problem.get("title", ""))
+		except Exception:  # noqa: BLE001, S110 - a proxy's HTML error page is still an error
+			# Deliberately not logged: the status line below carries everything actionable, and a
+			# gateway's error page in the log adds a screenful of markup per failure.
+			pass
+
+		message = f"{method} {path} -> {status} {code or 'unknown'}: {title}".strip()
+		if code in _SESSION_GONE_CODES:
+			return LiveSessionClosed(message, status=status)
+		return KorsiApiError(message, status=status)
+
+	# ------------------------------------------------------------------ the five calls
+
+	async def watchlist(self) -> LiveWatchlist:
+		"""Which Talk conversations Korsi would read a call in."""
+		payload = await self._request("GET", "/api/v1/meetings/live/watchlist")
+		return LiveWatchlist.model_validate(payload)
+
+	async def open_session(
+		self, *, room_remote_id: str, started_at: datetime, bridge_version: str | None = None
+	) -> LiveSessionDecision:
+		"""Ask whether to read this call, and open a session if the answer is yes.
+
+		`started_at` is when the *call* started, not when the bridge noticed. korsi-api uses it to
+		decide which meeting this is -- a Talk room is reused for every meeting a case holds, so the
+		timestamp is what separates this morning's standup from this afternoon's review.
+		"""
+		payload = await self._request(
+			"POST",
+			"/api/v1/meetings/live/sessions",
+			json_body={
+				"room_remote_id": room_remote_id,
+				"started_at": started_at.astimezone(UTC).isoformat(),
+				"bridge_version": bridge_version,
+			},
+		)
+		return LiveSessionDecision.model_validate(payload)
+
+	async def append_segment(
+		self, *, live_session_id: str, sequence: int, started_ms: int, ended_ms: int, text: str
+	) -> LiveSegmentAccepted:
+		"""Post one interval's worth of transcript.
+
+		Raises
+		------
+		LiveSessionClosed
+			korsi-api will not accept more transcript for this session. Stop and tear down; do not
+			retry, and do not keep the text for later -- a live reading has no value once the call
+			this session belonged to is over.
+		KorsiApiError
+			Anything else. Worth one more attempt on the next interval.
+
+		"""
+		payload = await self._request(
+			"POST",
+			f"/api/v1/meetings/live/sessions/{live_session_id}/segments",
+			json_body={
+				"sequence": sequence,
+				"started_ms": started_ms,
+				"ended_ms": ended_ms,
+				"text": text,
+			},
+		)
+		return LiveSegmentAccepted.model_validate(payload)
+
+	async def renew_credential(self, *, live_session_id: str) -> LiveSttCredential:
+		"""A fresh speech credential for a call that outlived the first one.
+
+		Korsi mints these with a lifetime measured in minutes; a two-hour meeting therefore needs
+		several. The bridge asks when its current key is close to expiring rather than on a schedule,
+		because a key it never had to use is a charge nobody incurred.
+		"""
+		payload = await self._request("POST", f"/api/v1/meetings/live/sessions/{live_session_id}/stt")
+		return LiveSttCredential.model_validate(payload)
+
+	async def close_session(
+		self, *, live_session_id: str, ended_at: datetime, reason: LiveCloseReason
+	) -> None:
+		"""Tell Korsi the call is over.
+
+		The response is discarded on purpose: it is the session's final state, and the bridge has
+		nothing left to do with it. What matters is that the call was made, so korsi-api settles the
+		metering hold now rather than leaving it to the abandoned-session sweep twenty minutes later.
+
+		Idempotent server-side, so a close that races the sweep is not an error.
+		"""
+		await self._request(
+			"POST",
+			f"/api/v1/meetings/live/sessions/{live_session_id}/close",
+			json_body={
+				"ended_at": ended_at.astimezone(UTC).isoformat(),
+				"reason": reason.value,
+			},
+		)

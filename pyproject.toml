@@ -1,5 +1,10 @@
 # SPDX-FileCopyrightText: 2025 Nextcloud GmbH and Nextcloud contributors
 # SPDX-License-Identifier: AGPL-3.0-or-later
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+filterwarnings = ["ignore::DeprecationWarning"]
+
 [tool.ruff]
 line-length = 120
 target-version = "py312"
@@ -7,6 +12,10 @@ target-version = "py312"
 [tool.ruff.lint]
 select = ["A", "B", "C", "D", "E", "F", "G", "I", "S", "SIM", "PIE", "Q", "RET", "RUF", "UP" , "W"]
 extend-ignore = ["D100", "D101", "D102", "D103", "D105", "D107", "D202", "D203", "D205", "D206", "D212", "D213", "D401", "E402", "I001", "RUF100", "D400", "D415", "W191"]
+
+[tool.ruff.lint.per-file-ignores]
+# Tests assert, reach into privates to test them directly, and do not need docstrings on every case.
+"tests/*" = ["S101", "S105", "S106", "SLF001", "D104", "ANN"]
 
 [tool.ruff.lint.mccabe]
 max-complexity = 12
@@ -42,5 +51,5 @@ messages_control.disable = [
 ]
 
 [[tool.mypy.overrides]]
-module = ["nc_py_api.*", "print_color.*", "vosk.*", "niquests.*"]
+module = ["nc_py_api.*", "niquests.*", "av.*", "aiortc.*"]
 follow_untyped_imports = true

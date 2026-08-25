@@ -9,43 +9,36 @@ import json
 import logging
 import os
 import weakref
-from collections.abc import Awaitable, Callable
+from collections.abc import Callable, Coroutine
 from contextlib import suppress
+from datetime import UTC, datetime
 from secrets import token_urlsafe
+from typing import Any
 from urllib.parse import urlparse
 
 from aiortc import RTCPeerConnection, RTCSessionDescription
 from aiortc.rtcconfiguration import RTCConfiguration, RTCIceServer
 from aiortc.sdp import candidate_from_sdp
+from audio_mixer import AudioMixer
 from audio_stream import AudioStream
 from constants import (
-	CALL_LEAVE_TIMEOUT,
 	HPB_PING_TIMEOUT,
 	HPB_SHUTDOWN_TIMEOUT,
 	ICE_GATHERING_TIMEOUT,
-	MAX_TRANSCRIPT_SEND_TIMEOUT,
-	MAX_TRANSLATION_SEND_TIMEOUT,
 	MSG_RECEIVE_TIMEOUT,
-	SEND_TIMEOUT,
-	TIMEOUT_INCREASE_FACTOR,
 )
+from korsi_client import KorsiClient
+from korsi_types import LiveCloseReason, LiveSessionOpened, LiveSttCredential
 from livetypes import (
 	CallFlag,
 	HPBSettings,
 	ReconnectMethod,
 	SigConnectResult,
 	SpreedRateLimitedException,
-	Target,
-	Transcript,
-	TranscriptTargetNotFoundException,
-	TranslateInputOutput,
-	TranslateLangPairException,
-	VoskException,
 )
-from meta_translator import MetaTranslator
-from models import LANGUAGE_MAP
 from nc_py_api import NextcloudApp
-from transcriber import VoskTranscriber
+from segmenter import Segmenter
+from soniox_stream import SonioxStream
 from utils import get_ssl_context, hmac_sha256, sanitize_websocket_url
 from websockets import ClientConnection
 from websockets import State as WsState
@@ -66,38 +59,20 @@ class SpreedClient:
 		self,
 		room_token: str,
 		hpb_settings: HPBSettings,
-		room_lang_id: str,
-		leave_call_cb: Callable[[str], Awaitable[None]] | None,  # room_token
+		*,
+		# `Coroutine` rather than `Awaitable`, because these are handed straight to
+		# `asyncio.create_task`, which does not accept a plain awaitable.
+		on_call_started: Callable[[str, datetime], Coroutine[Any, Any, None]],
+		on_call_ended: Callable[[str, LiveCloseReason], Coroutine[Any, Any, None]],
 	) -> None:
 		self.id = 0
 		self._server: ClientConnection | None = None
 		self._monitor: asyncio.Task | None = None
 		self.peer_connections: dict[str, PeerConnection] = {}
 		self.peer_connection_lock = asyncio.Lock()
-		self.targets: dict[str, Target] = {}
-		self.target_lock = asyncio.Lock()
-		self.nc_sid_map: dict[str, str] = {}  # {"nc_session_id": "session_id"}, use the same target lock
-		# the first target's Nextcloud session ID, used to defer the first target add until we join the call
-		self._nc_sid_wait_stash: dict[str, None] = {}
-		self.transcript_queue: asyncio.Queue = asyncio.Queue()
-		self._transcript_sender: asyncio.Task | None = None
-		self.transcribers: dict[str, VoskTranscriber] = {}
-		self.transcriber_lock = asyncio.Lock()
 		self.defunct = asyncio.Event()
 		self._close_task: asyncio.Task | None = None
-		self._deferred_close_task: asyncio.Task | None = None
 		self._reconnect_task: asyncio.Task | None = None
-		self.translate_queue_input: asyncio.Queue = asyncio.Queue()
-		self.translate_queue_output: asyncio.Queue = asyncio.Queue()
-		self.translated_text_sender: asyncio.Task | None = None
-		self.should_translate = asyncio.Event()  # set if at least one target has translation enabled
-		self.meta_translator = MetaTranslator(
-			room_token,
-			room_lang_id,
-			self.translate_queue_input,
-			self.translate_queue_output,
-			self.should_translate,
-		)
 
 		self.resumeid = None
 		self.sessionid = None
@@ -109,8 +84,30 @@ class SpreedClient:
 
 		self.room_token = room_token
 		self.hpb_settings = hpb_settings
-		self.room_lang_id = room_lang_id
-		self.leave_call_cb = leave_call_cb
+		self._on_call_started = on_call_started
+		self._on_call_ended = on_call_ended
+
+		# ---- reading state: everything below exists only while Korsi has an open session ----
+
+		#: True between `start_reading` and `stop_reading`. Everything that costs money is gated on it,
+		#: and it is what separates this fork's two jobs: sitting in a room watching for calls, which is
+		#: one idle websocket, and reading a call, which is a speech connection and an LLM every few
+		#: minutes. Upstream has only the second state.
+		self.reading = False
+		self._reading_lock = asyncio.Lock()
+		self._session: LiveSessionOpened | None = None
+		self._korsi: KorsiClient | None = None
+		self._mixer: AudioMixer | None = None
+		self._speech: SonioxStream | None = None
+		self._segmenter: Segmenter | None = None
+		self._credential_expires_at: datetime | None = None
+		#: Set once per call, so a participants update that mentions three people already in a call does
+		#: not ask Korsi three times.
+		self._call_announced = False
+
+		#: Non-internal sessions currently in the call with audio. Maintained whether or not the bridge
+		#: is reading, because the set at the moment Korsi says yes is exactly who to request audio from.
+		self._publishers_in_call: set[str] = set()
 
 
 	async def _resume_connection(self) -> bool:
@@ -242,7 +239,11 @@ class SpreedClient:
 					"room_token": self.room_token,
 					"tag": "connection",
 				})
-				await self.send_incall()
+				# Re-announce being in the call only if we were reading one. A resume during an idle
+				# watch must not put the bridge into a call nobody started -- it would show up as a
+				# participant in the room's UI and, worse, keep the call alive after the last human left.
+				if self.reading:
+					await self.send_incall()
 				await self.send_join()
 				return SigConnectResult.SUCCESS
 
@@ -270,7 +271,6 @@ class SpreedClient:
 				})
 			finally:
 				self.defunct.set()
-				self._deferred_close_task = None
 				self._monitor = None
 				self.resumeid = None
 				self.sessionid = None
@@ -367,34 +367,234 @@ class SpreedClient:
 		self.defunct.clear()
 		self._monitor = asyncio.create_task(self.signalling_monitor(), name=f"signalling_monitor-{self.room_token}")
 
-		# just to be safe, start the transcript sender if not already running, even in reconnects
-		if self._transcript_sender is None or self._transcript_sender.done():
-			self._transcript_sender = asyncio.create_task(
-				self.transcipt_queue_consumer(),
-				name=f"transcript_sender-{self.room_token}",
-			)
-
-		# just to be safe, start the translate sender if not already running, even in reconnects
-		if self.translated_text_sender is None or self.translated_text_sender.done():
-			self.translated_text_sender = asyncio.create_task(
-				self.translated_text_consumer(),
-				name=f"translated_text_sender-{self.room_token}",
-			)
-
-		if reconnect == ReconnectMethod.NO_RECONNECT:
-			# leave the call if there are no targets after some time
-			self._deferred_close_task = asyncio.create_task(
-				self.maybe_leave_call(),
-				name=f"deferred_close-{self.room_token}",
-			)
-
-		await self.send_incall()
+		# Join the room, but do not join the call. Upstream sends `incall` here because it is only ever
+		# constructed for a call somebody asked to have transcribed; this fork holds a session in every
+		# watched room continuously, and announcing itself as a call participant in all of them would
+		# both mislead the UI and, in an empty room, start a call.
+		#
+		# `incall` is sent by `start_reading` instead, once Korsi has said yes.
 		await self.send_join()
+		if self.reading:
+			# A full reconnect during a call we were already reading. The call did not end while the
+			# socket was down, so rejoin it rather than waiting for a participants update.
+			await self.send_incall()
+
 		LOGGER.info("Connected to signaling server", extra={
 			"room_token": self.room_token,
+			"reading": self.reading,
 			"tag": "connection",
 		})
 		return SigConnectResult.SUCCESS
+
+	# ------------------------------------------------------------------ reading a call
+
+	async def start_reading(self, session: LiveSessionOpened, korsi: KorsiClient) -> None:
+		"""Join the call and start turning it into text Korsi analyses.
+
+		Everything expensive starts here: the mixer, the speech connection and the interval timer. Held
+		under a lock because a participants update and a watcher retry can both arrive at the moment a
+		call starts, and two speech connections for one call is two bills.
+		"""
+		async with self._reading_lock:
+			if self.reading:
+				LOGGER.debug("Already reading this call", extra={
+					"room_token": self.room_token,
+					"tag": "reading",
+				})
+				return
+
+			self._session = session
+			self._korsi = korsi
+			self._credential_expires_at = session.stt.expires_at
+
+			self._mixer = AudioMixer()
+			await self._mixer.start()
+
+			self._speech = SonioxStream(
+				room_token=self.room_token,
+				credential=session.stt,
+				renew=self._renew_credential,
+				read_audio=self._mixer.read,
+			)
+			try:
+				await self._speech.start()
+			except Exception as e:
+				LOGGER.exception("Could not open the speech connection, not reading this call", exc_info=e, extra={
+					"room_token": self.room_token,
+					"tag": "reading",
+				})
+				await self._mixer.close()
+				self._mixer = None
+				self._speech = None
+				# Close the session Korsi opened. Leaving it dangling would hold a metering reservation
+				# for a call that produced nothing, until the sweep noticed twenty minutes later.
+				with suppress(Exception):
+					await korsi.close_session(
+						live_session_id=session.live_session_id,
+						ended_at=datetime.now(UTC),
+						reason=LiveCloseReason.BRIDGE_ERROR,
+					)
+				self._session = None
+				self._korsi = None
+				return
+
+			self._segmenter = Segmenter(
+				room_token=self.room_token,
+				live_session_id=session.live_session_id,
+				client=korsi,
+				first_interval_seconds=session.first_segment_interval_seconds,
+				interval_seconds=session.segment_interval_seconds,
+				finalize=self._speech.finalize,
+				drain_text=self._speech.drain_text,
+				on_session_gone=self._on_session_gone,
+			)
+			self._segmenter.start()
+			self.reading = True
+
+		await self.send_incall()
+		# Ask every participant already talking for their audio. Without this the bridge would only
+		# pick up people who joined *after* it did, which on a call that was already running is
+		# everybody who matters.
+		await self._request_offers_from_active_publishers()
+
+		LOGGER.info("Reading a call", extra={
+			"room_token": self.room_token,
+			"live_session_id": session.live_session_id,
+			"meeting_id": session.meeting_id,
+			"first_interval": session.first_segment_interval_seconds,
+			"interval": session.segment_interval_seconds,
+			"tag": "reading",
+		})
+
+	async def stop_reading(self, reason: LiveCloseReason) -> None:
+		"""Stop reading, flush the last segment, and close the Korsi session.
+
+		Order matters and is the reverse of `start_reading` for one reason: the segmenter is stopped
+		with a flush *before* the speech connection closes, so the tail of the meeting -- which is where
+		the decisions are -- is finalised and posted rather than discarded with the connection.
+		"""
+		async with self._reading_lock:
+			if not self.reading:
+				return
+			self.reading = False
+			segmenter, speech, mixer = self._segmenter, self._speech, self._mixer
+			session, korsi = self._session, self._korsi
+			self._segmenter = self._speech = self._mixer = None
+			self._session = self._korsi = None
+			self._call_announced = False
+
+		if segmenter is not None:
+			with suppress(Exception):
+				await segmenter.stop(flush=True)
+
+		if speech is not None:
+			with suppress(Exception):
+				await speech.aclose()
+
+		if mixer is not None:
+			with suppress(Exception):
+				await mixer.close()
+
+		# Drop the peer connections: they belong to the call, not to the room, and holding them across
+		# a call boundary would leave the next call answering offers with stale transceivers.
+		async with self.peer_connection_lock:
+			connections = list(self.peer_connections.values())
+			self.peer_connections.clear()
+		for entry in connections:
+			with suppress(Exception):
+				await entry.pc.close()
+
+		with suppress(Exception):
+			await self.send_bye_to_call()
+
+		if session is not None and korsi is not None:
+			effective = reason
+			if speech is not None and speech.failed.is_set():
+				effective = LiveCloseReason.BRIDGE_ERROR
+				LOGGER.warning("Closing a session whose speech connection failed", extra={
+					"room_token": self.room_token,
+					"failure": speech.failure_reason,
+					"tag": "reading",
+				})
+			try:
+				await korsi.close_session(
+					live_session_id=session.live_session_id,
+					ended_at=datetime.now(UTC),
+					reason=effective,
+				)
+				LOGGER.info("Closed the live session", extra={
+					"room_token": self.room_token,
+					"live_session_id": session.live_session_id,
+					"reason": effective.value,
+					"segments": segmenter.segments_posted if segmenter else 0,
+					"tag": "reading",
+				})
+			except Exception as e:  # noqa: BLE001 - the sweep is the backstop
+				LOGGER.warning("Could not close the live session; Korsi will reap it", exc_info=e, extra={
+					"room_token": self.room_token,
+					"live_session_id": session.live_session_id,
+					"tag": "reading",
+				})
+
+	async def _on_session_gone(self) -> None:
+		"""korsi-api says this session is finished while the call is still up.
+
+		Stop reading but keep watching the room. The call may well continue, and if a later call in the
+		same room is accepted the bridge should read that one.
+		"""
+		await self.stop_reading(LiveCloseReason.CALL_ENDED)
+
+	async def _renew_credential(self) -> LiveSttCredential:
+		"""A fresh speech credential.
+
+		Called only when Soniox says the current one is spent, never on a timer -- see the note in
+		`constants.py`. A long meeting does this several times.
+		"""
+		if self._korsi is None or self._session is None:
+			raise RuntimeError("cannot renew a speech credential outside a reading session")
+		credential = await self._korsi.renew_credential(live_session_id=self._session.live_session_id)
+		self._credential_expires_at = credential.expires_at
+		LOGGER.info("Renewed the speech credential", extra={
+			"room_token": self.room_token,
+			"expires_at": credential.expires_at.isoformat(),
+			"tag": "reading",
+		})
+		return credential
+
+	async def _announce_call_ended(self, reason: LiveCloseReason) -> None:
+		"""Tell the watcher the call is over, if there was one to end.
+
+		Also resets `_call_announced`, which is what allows the next call in this room to be offered to
+		Korsi. Without the reset a room would be read once and then never again for as long as the
+		container lived.
+		"""
+		was_announced = self._call_announced
+		self._call_announced = False
+		if not was_announced and not self.reading:
+			return
+		asyncio.create_task(  # noqa: RUF006 - deliberately not awaited inside the monitor loop
+			self._on_call_ended(self.room_token, reason),
+			name=f"call-ended-{self.room_token}",
+		)
+
+	async def _drop_peer_connection(self, session_id: str) -> None:
+		async with self.peer_connection_lock:
+			entry = self.peer_connections.pop(session_id, None)
+		if entry is None:
+			return
+		with suppress(Exception):
+			if entry.pc.connectionState not in ("closed", "failed"):
+				await entry.pc.close()
+
+	async def _request_offers_from_active_publishers(self) -> None:
+		"""Ask for audio from everyone already in the call.
+
+		Best effort: the HPB answers with offers, which the monitor handles. A participant who is muted
+		still has an audio track, so this is not restricted to people currently speaking.
+		"""
+		for session_id in list(self._publishers_in_call):
+			with suppress(Exception):
+				await self.send_offer_request(session_id)
 
 	async def send_message(self, message: dict):
 		if not self._server:
@@ -500,7 +700,7 @@ class SpreedClient:
 					"roomType": "video",
 					"sid": offer_sid,
 					"payload": {
-						"nick": "I am the big transcriber",
+						"nick": "Korsi",
 						"type": "answer",
 						"sdp": sdp
 					}
@@ -538,56 +738,22 @@ class SpreedClient:
 			"bye": {}
 		})
 
-	async def send_transcript(self, transcript: Transcript):
-		async with self.target_lock:
-			if not self.targets:
-				LOGGER.debug("No targets to send transcript to, skipping", extra={
-					"room_token": self.room_token,
-					"transcript": transcript,
-					"tag": "transcript",
-				})
-				return
-			sids = list(self.targets.keys())
+	async def send_bye_to_call(self):
+		"""Leave the call but stay in the room.
 
-		for sid in sids:
-			await self.send_message({
-				"type": "message",
-				"message": {
-					"recipient": {
-						"type": "session",
-						"sessionid": sid,
-					},
-					"data": {
-						"final": transcript.final,
-						"langId": transcript.lang_id,
-						"message": transcript.message,
-						"speakerSessionId": transcript.speaker_session_id,
-						"type": "transcript",
-					},
-				}
-			})
-
-	async def send_translated_text(self, segment: TranslateInputOutput):
-		for nc_sid in segment.target_nc_session_ids:
-			if nc_sid not in self.nc_sid_map:
-				continue
-			await self.send_message({
-				"type": "message",
-				"message": {
-					"recipient": {
-						"type": "session",
-						"sessionid": self.nc_sid_map[nc_sid],
-					},
-					"data": {
-						"langId": segment.target_language,
-						"message": segment.message,
-						"speakerSessionId": segment.speaker_session_id,
-						"final": True,
-						# todo: change to "translate"?
-						"type": "transcript",
-					},
-				}
-			})
+		`incall: 0` rather than `bye`, which is the distinction this fork needs and upstream does not:
+		`bye` ends the whole signaling session, and the bridge has to keep its room session to notice
+		the *next* call. So the bridge stops being a call participant and goes back to watching.
+		"""
+		await self.send_message({
+			"type": "internal",
+			"internal": {
+				"type": "incall",
+				"incall": {
+					"incall": CallFlag.DISCONNECTED,
+				},
+			},
+		})
 
 	async def close(self):  # noqa: C901
 		if self.defunct.is_set():
@@ -597,14 +763,6 @@ class SpreedClient:
 			})
 			return
 
-		if self._deferred_close_task and not self._deferred_close_task.done():
-			LOGGER.debug("Cancelling deferred close task", extra={
-				"room_token": self.room_token,
-				"tag": "deferred_close",
-			})
-			self._deferred_close_task.cancel()
-		self._deferred_close_task = None
-
 		if self._reconnect_task and not self._reconnect_task.done():
 			LOGGER.debug("Cancelling reconnect task", extra={
 				"room_token": self.room_token,
@@ -612,8 +770,6 @@ class SpreedClient:
 			})
 			self._reconnect_task.cancel()
 		self._reconnect_task = None
-
-		app_closing = self._monitor.cancelled() if self._monitor else False
 
 		with suppress(Exception):
 			if self._monitor and not self._monitor.done():
@@ -628,16 +784,9 @@ class SpreedClient:
 		with suppress(Exception):
 			await self.send_bye()
 
-		with suppress(Exception):
-			LOGGER.debug("Shutting down all transcribers", extra={
-				"room_token": self.room_token,
-				"tag": "transcriber",
-			})
-			for transcriber in self.transcribers.values():
-				await transcriber.shutdown()
-			async with self.transcriber_lock:
-				self.transcribers.clear()
-
+		# Reading is torn down by `stop_reading`, which the watcher calls before this. Not repeated here
+		# on purpose: closing the Korsi session is the one step in teardown that must happen exactly
+		# once, and a second attempt from a close path would race the first.
 		with suppress(Exception):
 			for pc in self.peer_connections.values():
 				if pc.pc.connectionState != "closed" and pc.pc.connectionState != "failed":
@@ -654,38 +803,6 @@ class SpreedClient:
 			self.sessionid = None
 
 		with suppress(Exception):
-			if self._transcript_sender and not self._transcript_sender.done():
-				LOGGER.debug("Cancelling transcript sender task", extra={
-					"room_token": self.room_token,
-					"tag": "transcript",
-				})
-				self._transcript_sender.cancel()
-			self._transcript_sender = None
-
-		with suppress(Exception):
-			self.should_translate.clear()
-			await self.meta_translator.shutdown()
-			if self.translated_text_sender and not self.translated_text_sender.done():
-				LOGGER.debug("Cancelling translated text sender task", extra={
-					"room_token": self.room_token,
-					"tag": "translate",
-				})
-				self.translated_text_sender.cancel()
-			self.translated_text_sender = None
-
-		while not self.transcript_queue.empty():
-			with suppress(Exception):
-				self.transcript_queue.get_nowait()
-
-		while not self.translate_queue_input.empty():
-			with suppress(Exception):
-				self.translate_queue_input.get_nowait()
-
-		while not self.translate_queue_output.empty():
-			with suppress(Exception):
-				self.translate_queue_output.get_nowait()
-
-		with suppress(Exception):
 			if self._server and self._server.state == WsState.OPEN:
 				LOGGER.info("Closing WebSocket connection for room", extra={
 					"room_token": self.room_token,
@@ -695,10 +812,11 @@ class SpreedClient:
 				await self._server.close()
 			self._server = None
 
+		# No leave callback. Upstream calls back into `Application` to delete itself from the registry,
+		# because there the client's existence *is* the transcription. Here the watcher owns the
+		# registry and reconciles it against Korsi's watchlist on every poll, so a client that has
+		# become defunct is noticed and replaced rather than having to announce it.
 		self.defunct.set()
-		if not app_closing and self.leave_call_cb:
-			await self.leave_call_cb(self.room_token)
-		self.leave_call_cb = None
 
 	async def receive(self, timeout: int = 0) -> dict | None:
 		if not self._server:
@@ -721,112 +839,6 @@ class SpreedClient:
 			"tag": "receive",
 		})
 		return message
-
-	async def add_target(self, nc_session_id: str):
-		async with self.target_lock:
-			if nc_session_id not in self.nc_sid_map:
-				# stash the NC session IDs until we receive the participants update
-				self._nc_sid_wait_stash[nc_session_id] = None
-				LOGGER.debug("HPB session ID corresponding to Nextcloud session ID '%s' not found, deferring add",
-					extra={
-						"nc_session_id": nc_session_id,
-						"room_token": self.room_token,
-						"tag": "target",
-					})
-				return
-
-			self._nc_sid_wait_stash.pop(nc_session_id, None)
-			session_id = self.nc_sid_map[nc_session_id]
-			if session_id not in self.targets:
-				self.targets[session_id] = Target()
-				LOGGER.info("Added transcript target", extra={
-					"session_id": session_id,
-					"nc_session_id": nc_session_id,
-					"targets": self.targets,
-					"room_lang_id": self.room_lang_id,
-					"room_token": self.room_token,
-					"tag": "target",
-				})
-			else:
-				LOGGER.info("Transcript target already exists", extra={
-					"session_id": session_id,
-					"nc_session_id": nc_session_id,
-					"targets": self.targets,
-					"room_lang_id": self.room_lang_id,
-					"room_token": self.room_token,
-					"tag": "target",
-				})
-			if self._deferred_close_task:
-				self._deferred_close_task.cancel()
-				self._deferred_close_task = None
-
-	async def is_target(self, nc_session_id: str):
-		"""Check if the given Nextcloud session ID corresponds to an active transcript target."""
-		async with self.target_lock:
-			return nc_session_id in self.nc_sid_map or nc_session_id in self._nc_sid_wait_stash
-
-	async def remove_target(self, nc_session_id: str):
-		async with self.target_lock:
-			self._nc_sid_wait_stash.pop(nc_session_id, None)
-			if nc_session_id not in self.nc_sid_map:
-				LOGGER.info("HPB session ID corresponding to Nextcloud session ID '%s' not found",
-					nc_session_id,
-					extra={
-						"nc_session_id": nc_session_id,
-						"room_token": self.room_token,
-						"tag": "target",
-					},
-				)
-				return
-
-			session_id = self.nc_sid_map[nc_session_id]
-			if session_id in self.targets:
-				LOGGER.info("Removed transcript target", extra={
-					"session_id": session_id,
-					"nc_session_id": nc_session_id,
-					"targets": self.targets,
-					"room_lang_id": self.room_lang_id,
-					"room_token": self.room_token,
-					"tag": "target",
-				})
-				del self.targets[session_id]
-				if len(self.targets) == 0:
-					if self._deferred_close_task:
-						self._deferred_close_task.cancel()
-					self._deferred_close_task = asyncio.create_task(self.maybe_leave_call())
-			else:
-				LOGGER.info("Transcript target does not exist", extra={
-					"session_id": session_id,
-					"nc_session_id": nc_session_id,
-					"targets": self.targets,
-					"room_lang_id": self.room_lang_id,
-					"room_token": self.room_token,
-					"tag": "target",
-				})
-
-	async def remove_target_hpb_sid(self, session_id: str):
-		async with self.target_lock:
-			if session_id in self.targets:
-				LOGGER.info("Removed transcript target", extra={
-					"session_id": session_id,
-					"targets": self.targets,
-					"room_lang_id": self.room_lang_id,
-					"room_token": self.room_token,
-					"tag": "target",
-				})
-				del self.targets[session_id]
-				if len(self.targets) == 0:
-					if self._deferred_close_task:
-						self._deferred_close_task.cancel()
-					self._deferred_close_task = asyncio.create_task(self.maybe_leave_call())
-			else:
-				LOGGER.info("Transcript target does not exist", extra={
-					"session_id": session_id,
-					"targets": self.targets,
-					"room_lang_id": self.room_lang_id,
-					"room_token": self.room_token,
-					"tag": "target",
-				})
 
 	async def signalling_monitor(self):  # noqa: C901
 		"""Monitor the signaling server for incoming messages."""
@@ -899,14 +911,17 @@ class SpreedClient:
 				})
 
 				if message["event"]["update"].get("all") and message["event"]["update"].get("incall") == 0:
-					LOGGER.info("Call ended for everyone, closing connection", extra={
+					# The call ended for everybody. Upstream closes the whole client here; this fork
+					# stops reading and keeps the room session, because the next call in this room
+					# should be read too and rebuilding the signaling session for it would mean
+					# missing its first minute.
+					LOGGER.info("Call ended for everyone", extra={
 						"room_token": self.room_token,
-						"recv_message": message,
 						"tag": "participants",
 					})
-					if not self._close_task:
-						self._close_task = asyncio.create_task(self.close(), name=f"close-{self.room_token}")
-					return
+					self._publishers_in_call.clear()
+					await self._announce_call_ended(LiveCloseReason.CALL_ENDED)
+					continue
 
 				users_update = message["event"]["update"].get("users", [])
 				if not users_update:
@@ -916,88 +931,63 @@ class SpreedClient:
 					if user_desc.get("internal", False):
 						continue
 
-					if user_desc["inCall"] == CallFlag.DISCONNECTED:
-						LOGGER.info("User disconnected", extra={
-							"user_desc": user_desc,
+					session_id = user_desc.get("sessionId")
+					if not session_id:
+						continue
+					in_call = user_desc.get("inCall") or CallFlag.DISCONNECTED
+
+					if in_call == CallFlag.DISCONNECTED:
+						LOGGER.info("Participant left the call", extra={
+							"session_id": session_id,
 							"room_token": self.room_token,
 							"tag": "participants",
 						})
-						# the transcription should automatically stop when the audio track is closed
-						# cleaning it up in this class
-						async with self.transcriber_lock:
-							if user_desc["sessionId"] in self.transcribers:
-								await self.transcribers[user_desc["sessionId"]].shutdown()
-								del self.transcribers[user_desc["sessionId"]]
-						await self.remove_target_hpb_sid(user_desc["sessionId"])
-						async with self.target_lock:
-							# "nextcloudSessionId" may not be present in the user_desc in call disconnects
-							self.nc_sid_map.pop(user_desc.get("nextcloudSessionId", ""), None)
+						self._publishers_in_call.discard(session_id)
+						# Detach from the mix rather than tearing anything down. The speech connection
+						# belongs to the call, so one person leaving a four-person meeting must not end
+						# it -- which is precisely what upstream's per-publisher transcriber does.
+						if self._mixer is not None:
+							await self._mixer.detach(session_id)
+						await self._drop_peer_connection(session_id)
 						continue
 
-					# user connected, keep a map of Nextcloud session IDs to HPB session IDs
-					async with self.target_lock:
-						# not sure why a KeyError is hit when the monitor task is cancelled,
-						# adding a guard to prevent error logs
-						if "nextcloudSessionId" in user_desc:
-							# todo: get the userid for the session ids and maintain a map in "sid_translation_lang_map"
-							# todo: use the ownerId of the room for the OCP translations, using talk api, or something.
-							self.nc_sid_map[user_desc["nextcloudSessionId"]] = user_desc["sessionId"]
+					if in_call & CallFlag.IN_CALL and in_call & CallFlag.WITH_AUDIO:
+						self._publishers_in_call.add(session_id)
 
-					# if this is one of the deferred targets, add it to the targets
-					if (user_desc["nextcloudSessionId"] in self._nc_sid_wait_stash):
-						LOGGER.debug("Adding one of the deferred targets to the target dict", extra={
-							"nc_session_id": user_desc["nextcloudSessionId"],
-							"session_id": user_desc["sessionId"],
-							"room_token": self.room_token,
-							"tag": "target",
-						})
-						await self.add_target(user_desc["nextcloudSessionId"])
+						# First evidence that a call is happening in this room. Ask Korsi, once.
+						if not self._call_announced:
+							self._call_announced = True
+							LOGGER.info("A call started in a watched room", extra={
+								"room_token": self.room_token,
+								"session_id": session_id,
+								"tag": "participants",
+							})
+							# Detached: opening a session is an HTTP round trip and the monitor must
+							# keep draining the signaling socket, or the HPB backs up behind us.
+							asyncio.create_task(  # noqa: RUF006 - lifetime is the monitor's
+								self._on_call_started(self.room_token, datetime.now(UTC)),
+								name=f"call-started-{self.room_token}",
+							)
 
-					# user connected with audio
-					if (user_desc["inCall"] & CallFlag.IN_CALL and user_desc["inCall"] & CallFlag.WITH_AUDIO):
-						LOGGER.info("User joined with audio", extra={
-							"user_desc": user_desc,
-							"room_token": self.room_token,
-							"tag": "participants",
-						})
+						if not self.reading:
+							# Not reading this call, either because Korsi has not answered yet or
+							# because it declined. Requesting audio would cost bandwidth for nothing.
+							continue
+
 						async with self.peer_connection_lock:
-							if (
-								user_desc["sessionId"] in self.peer_connections
-								and self.peer_connections[user_desc["sessionId"]].pc.connectionState != "closed"
-								and self.peer_connections[user_desc["sessionId"]].pc.connectionState != "failed"
-							):
-								LOGGER.info("Peer connection for user already exists, skipping offer request", extra={
-									"user_desc": user_desc,
-									"room_token": self.room_token,
-									"tag": "participants",
-								})
+							existing = self.peer_connections.get(session_id)
+							if existing and existing.pc.connectionState not in ("closed", "failed"):
 								continue
-						await self.send_offer_request(user_desc["sessionId"])
+						await self.send_offer_request(session_id)
 						continue
 
-				# the last user just left the call, live_transcription is the only one left
-				if (len(users_update) == 2):
-					if (
-						users_update[0].get("sessionId") != self.sessionid
-						and users_update[1].get("sessionId") != self.sessionid
-					):
-						# false alarm, we are not the only one left
-						continue
-
-					# if we are the only one left, close the connection
-					transcriber_index = 0 if users_update[0].get("sessionId") == self.sessionid else 1
-					if (
-						users_update[transcriber_index].get("inCall") & CallFlag.IN_CALL
-						and users_update[transcriber_index^1].get("inCall") == CallFlag.DISCONNECTED
-					):
-						LOGGER.info("Last user left the call, closing connection", extra={
-							"room_token": self.room_token,
-							"transcriber_session_id": users_update[transcriber_index].get("sessionId"),
-							"tag": "participants",
-						})
-						if not self._close_task:
-							self._close_task = asyncio.create_task(self.close(), name=f"close-{self.room_token}")
-						return
+				# Everyone with audio has gone and only the bridge is left in the call.
+				if self.reading and not self._publishers_in_call:
+					LOGGER.info("No participants left in the call", extra={
+						"room_token": self.room_token,
+						"tag": "participants",
+					})
+					await self._announce_call_ended(LiveCloseReason.CALL_ENDED)
 
 			if message["type"] == "message" and message["message"]["data"]["type"] == "offer":
 				LOGGER.debug("Received offer message", extra={
@@ -1032,39 +1022,6 @@ class SpreedClient:
 				})
 				if not self._close_task:
 					self._close_task = asyncio.create_task(self.close(), name=f"close-{self.room_token}")
-
-	async def maybe_leave_call(self):
-		"""Leave the call if there are no targets."""
-		LOGGER.debug("Waiting to leave call if there are no targets", extra={
-			"room_token": self.room_token,
-			"tag": "maybe_leave_call",
-		})
-		await asyncio.sleep(CALL_LEAVE_TIMEOUT)
-
-		if self.defunct.is_set():
-			LOGGER.debug("SpreedClient is already defunct, clearing deferred close task and returning", extra={
-				"room_token": self.room_token,
-				"tag": "maybe_leave_call",
-			})
-			self._deferred_close_task = None
-			return
-
-		async with self.target_lock:
-			len_targets = len(self.targets)
-		if (
-			len_targets == 0
-			and not (self.should_translate.is_set() and await self.meta_translator.is_translating())
-		):
-			LOGGER.warning("No transcript/translation receivers for %s secs, leaving the call",
-				CALL_LEAVE_TIMEOUT,
-				extra={
-					"room_token": self.room_token,
-					"tag": "maybe_leave_call",
-				}
-			)
-			if not self._close_task:
-				self._close_task = asyncio.create_task(self.close(), name=f"close-{self.room_token}")
-		self._deferred_close_task = None
 
 	async def handle_offer(self, message):  # noqa: C901
 		"""Handle incoming offer messages."""
@@ -1148,46 +1105,23 @@ class SpreedClient:
 					})
 					return
 
-				stream = AudioStream(track)
-				async with weakself().transcriber_lock:
-					weakself().transcribers[spkr_sid] = VoskTranscriber(
-						spkr_sid,
-						weakself().room_lang_id,
-						weakself().transcript_queue,
-						weakself().should_translate,
-						weakself().translate_queue_input,
-					)
+				mixer = weakself()._mixer
+				if mixer is None:
+					# An offer answered after `stop_reading` tore the mixer down. Dropping the track is
+					# correct: there is nothing to feed and no session to feed it to.
+					LOGGER.debug("Track arrived with no mixer, dropping it", extra={
+						"session_id": spkr_sid,
+						"room_token": weakself().room_token,
+						"tag": "track",
+					})
+					with suppress(Exception):
+						track.stop()
+					return
 
-					try:
-						await weakself().transcribers[spkr_sid].connect()
-						await weakself().transcribers[spkr_sid].start(stream=stream)
-					except Exception:
-						LOGGER.exception("Error in connection and start of the Vosk server. Cannot continue further.",
-							extra={
-								"server_url": os.getenv("LT_VOSK_SERVER_URL", "ws://localhost:2702"),
-								"session_id": spkr_sid,
-								"room_token": weakself().room_token,
-								"tag": "vosk",
-							},
-						)
-						if not weakself()._close_task:
-							weakself()._close_task = asyncio.create_task(
-								weakself().close(),
-								name=f"close-{weakself().room_token}",
-							)
-						return
-
-					LOGGER.info(
-						"Started transcriber for %s in %s",
-						spkr_sid,
-						LANGUAGE_MAP.get(weakself().room_lang_id).name,
-						extra={
-							"session_id": spkr_sid,
-							"room_lang_id": weakself().room_lang_id,
-							"room_token": weakself().room_token,
-							"tag": "transcriber",
-						},
-					)
+				# Into the mix, not into a transcriber of its own. One speech connection per call is
+				# the whole cost argument (ADR-0021 D2), and it is also what lets the connection
+				# outlive any individual participant.
+				await mixer.attach(spkr_sid, AudioStream(track))
 
 		async with self.peer_connection_lock:
 			self.peer_connections[spkr_sid] = PeerConnection(session_id=spkr_sid, pc=pc)
@@ -1235,218 +1169,3 @@ class SpreedClient:
 				)
 
 		LOGGER.info("Sent candidates to the peer", extra={ "candidates": candidates })
-
-	async def set_language(self, lang_id: str):
-		excs = []
-		async with self.transcriber_lock:
-			transcribers = list(self.transcribers.values())
-		try:
-			for transcriber in transcribers:
-				await transcriber.set_language(lang_id)
-		except Exception as e:
-			excs.append(e)
-		if len(excs) > 1:
-			LOGGER.error("Failed to set language for multiple transcribers", extra={
-				"lang_id": lang_id,
-				"room_token": self.room_token,
-				"excs": excs,
-				"tag": "transcriber",
-			})
-			raise VoskException(
-				f"Failed to set language for multiple transcribers, first of which is: {excs[0]}",
-				retcode=500,
-			)
-		if len(excs) == 1:
-			raise VoskException(f"Failed to set language for one transcriber: {excs[0]}", retcode=500)
-		self.room_lang_id = lang_id
-
-	async def transcipt_queue_consumer(self):
-		"""Consume transcripts from the queue and send them to the server."""
-		LOGGER.debug("Starting the transcript queue consumer", extra={
-			"room_token": self.room_token,
-			"tag": "transcript",
-		})
-		timeout = SEND_TIMEOUT
-		timeout_count = 0
-
-		while True:
-			try:
-				transcript: Transcript = await self.transcript_queue.get()  # type: ignore[annotation-unchecked]
-
-				await asyncio.wait_for(
-					self.send_transcript(transcript),
-					timeout=timeout,
-				)
-				timeout_count -= 1 if timeout_count > 0 else 0
-				if timeout_count == 0 and timeout > SEND_TIMEOUT:
-					timeout = max(SEND_TIMEOUT, int(timeout / TIMEOUT_INCREASE_FACTOR))
-					LOGGER.debug("Decreased transcript send timeout to %d seconds", timeout, extra={
-						"speaker_session_id": transcript.speaker_session_id,
-						"room_token": self.room_token,
-						"tag": "translate",
-					})
-			except TimeoutError:
-				LOGGER.error("Timeout while sending a transcript", extra={
-					"speaker_session_id": transcript.speaker_session_id,
-					"room_token": self.room_token,
-					"tag": "transcript",
-				})
-
-				if timeout > MAX_TRANSCRIPT_SEND_TIMEOUT:
-					LOGGER.warning("Transcription timeout too high (%d seconds), not increasing further",
-						timeout,
-						extra={
-						"speaker_session_id": transcript.speaker_session_id,
-						"room_token": self.room_token,
-						"tag": "translate",
-						},
-					)
-					continue
-
-				timeout_count += 1
-				if timeout_count >= 5:
-					timeout = int(timeout * TIMEOUT_INCREASE_FACTOR)
-					LOGGER.error("Multiple timeouts while sending transcripts, increasing to %d", timeout, extra={
-						"origin_language": transcript.origin_language,
-						"target_language": transcript.target_language,
-						"speaker_session_id": transcript.speaker_session_id,
-						"room_token": self.room_token,
-						"tag": "translate",
-					})
-					timeout_count = 0
-				continue
-
-			except asyncio.CancelledError:
-				LOGGER.debug("Transcript consumer task cancelled", extra={
-					"room_token": self.room_token,
-					"tag": "transcript",
-				})
-				raise
-			except Exception as e:
-				LOGGER.exception("Error while sending transcript", exc_info=e, extra={
-					"speaker_session_id": transcript.speaker_session_id,
-					"room_token": self.room_token,
-					"tag": "transcript",
-				})
-				continue
-
-	async def set_target_language(self, nc_session_id: str, target_lang_id: str, new_call: bool = False):
-		"""
-		Raises
-		------
-			TranslateFatalException: If a fatal error occurs and all translators should be removed
-			TranslateLangPairException: If the language pair is not supported
-			TranslateException: If any other translation error occurs
-			TranscriptTargetNotFoundException: If the transcript target is not found and new_call is False
-		"""  # noqa
-
-		if target_lang_id == self.room_lang_id:
-			LOGGER.debug("Target language is the same as the original language, doing nothing", extra={
-				"nc_session_id": nc_session_id,
-				"target_lang_id": target_lang_id,
-				"original_lang_id": self.room_lang_id,
-				"room_token": self.room_token,
-				"tag": "translate",
-			})
-			raise TranslateLangPairException(
-				f"Target language '{target_lang_id}' is the same as the original language '{self.room_lang_id}'",
-			)
-
-		if (
-			not new_call
-			and not await self.is_target(nc_session_id)
-			and not await self.meta_translator.is_translation_target(nc_session_id)
-		):
-			raise TranscriptTargetNotFoundException(
-				f"Transcript target with Nextcloud session ID '{nc_session_id}' not found."
-				" Transcription must be enabled for the target before setting the translation language.",
-			)
-
-		if not await self.meta_translator.is_target_lang_supported(target_lang_id):
-			raise TranslateLangPairException(
-				f"Target language '{target_lang_id}' is not supported",
-			)
-
-		await self.meta_translator.add_translator(target_lang_id, nc_session_id)
-		# prevent original language transcripts from being sent to this target
-		await self.remove_target(nc_session_id)
-
-	async def remove_translation(self, nc_session_id: str, add_target_back: bool = False):
-		await self.meta_translator.remove_translator(nc_session_id)
-		if add_target_back:
-			# add the target back to receive original language transcripts
-			await self.add_target(nc_session_id)
-
-	async def translated_text_consumer(self):
-		"""Consume translated text segments from the queue and send them to the server."""
-		LOGGER.debug("Starting the translated text queue consumer", extra={
-			"room_token": self.room_token,
-			"tag": "translate",
-		})
-		timeout = SEND_TIMEOUT
-		timeout_count = 0
-		while True:
-			try:
-				segment: TranslateInputOutput = await self.translate_queue_output.get()  # type: ignore[annotation-unchecked]
-
-				await asyncio.wait_for(
-					self.send_translated_text(segment),
-					timeout=timeout,
-				)
-				timeout_count -= 1 if timeout_count > 0 else 0
-				if timeout_count == 0 and timeout > SEND_TIMEOUT:
-					timeout = max(SEND_TIMEOUT, int(timeout / TIMEOUT_INCREASE_FACTOR))
-					LOGGER.debug("Decreased translated text send timeout to %d seconds", timeout, extra={
-						"origin_language": segment.origin_language,
-						"target_language": segment.target_language,
-						"speaker_session_id": segment.speaker_session_id,
-						"room_token": self.room_token,
-						"tag": "translate",
-					})
-			except TimeoutError:
-				LOGGER.debug("Timeout while sending a translated text", extra={
-					"origin_language": segment.origin_language,
-					"target_language": segment.target_language,
-					"speaker_session_id": segment.speaker_session_id,
-					"room_token": self.room_token,
-					"tag": "translate",
-				})
-
-				if timeout > MAX_TRANSLATION_SEND_TIMEOUT:
-					LOGGER.warning("Translation timeout too high (%d seconds), not increasing further", timeout, extra={
-						"origin_language": segment.origin_language,
-						"target_language": segment.target_language,
-						"speaker_session_id": segment.speaker_session_id,
-						"room_token": self.room_token,
-						"tag": "translate",
-					})
-					continue
-
-				timeout_count += 1
-				if timeout_count >= 5:
-					timeout = int(timeout * TIMEOUT_INCREASE_FACTOR)
-					LOGGER.error("Multiple timeouts while sending translated texts, increasing to %d", timeout, extra={
-						"origin_language": segment.origin_language,
-						"target_language": segment.target_language,
-						"speaker_session_id": segment.speaker_session_id,
-						"room_token": self.room_token,
-						"tag": "translate",
-					})
-					timeout_count = 0
-				continue
-
-			except asyncio.CancelledError:
-				LOGGER.debug("Translated text consumer task cancelled", extra={
-					"room_token": self.room_token,
-					"tag": "translate",
-				})
-				raise
-			except Exception as e:
-				LOGGER.exception("Error while sending a translated text", exc_info=e, extra={
-					"origin_language": segment.origin_language,
-					"target_language": segment.target_language,
-					"speaker_session_id": segment.speaker_session_id,
-					"room_token": self.room_token,
-					"tag": "translate",
-				})
-				continue

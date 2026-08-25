@@ -83,19 +83,34 @@ def check_hpb_env_vars():
 			"Verify that it is a valid URL with a protocol and hostname."
 		)
 
-	vosk_url = os.environ.get("LT_VOSK_SERVER_URL")
-	if vosk_url:
-		vosk_url_parsed = urlparse(vosk_url)
-		vosk_host = vosk_url_parsed.hostname
-		if not vosk_host:
-			raise ValueError(
-				f"Could not detect hostname in LT_VOSK_SERVER_URL: {vosk_url}. "
-				"Verify that it is a valid URL with a protocol and hostname."
-			)
-		try:
-			_ = vosk_url_parsed.port
-		except ValueError as e:
-			raise ValueError(f"Invalid VOSK server URL: {vosk_url}") from e
+
+#: Everything the bridge needs to talk to Korsi. All five, because there is no useful partial state:
+#: without any one of them the bridge cannot ask which rooms to watch, and therefore does nothing.
+KORSI_REQUIRED_VARS = (
+	"KORSI_API_URL",
+	"KORSI_TOKEN_URL",
+	"KORSI_CLIENT_ID",
+	"KORSI_CLIENT_SECRET",
+	"KORSI_TOKEN_SCOPE",
+)
+
+
+def check_korsi_env_vars() -> list[str]:
+	"""Which Korsi settings are missing.
+
+	Returns names rather than raising, and names rather than values: two of these are secrets, and this
+	result is rendered into the Nextcloud admin UI and into a status endpoint.
+	"""
+	missing = [var for var in KORSI_REQUIRED_VARS if not os.getenv(var)]
+
+	api_url = os.getenv("KORSI_API_URL")
+	if api_url and not urlparse(api_url).hostname:
+		missing.append("KORSI_API_URL (not a valid URL)")
+	token_url = os.getenv("KORSI_TOKEN_URL")
+	if token_url and not urlparse(token_url).hostname:
+		missing.append("KORSI_TOKEN_URL (not a valid URL)")
+
+	return missing
 
 
 def get_hpb_settings() -> HPBSettings:

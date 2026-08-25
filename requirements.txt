@@ -1,17 +1,20 @@
+# SPDX-FileCopyrightText: 2025 Nextcloud GmbH and Nextcloud contributors
+# SPDX-FileCopyrightText: 2026 Pishrun and Korsi contributors
+# SPDX-License-Identifier: AGPL-3.0-or-later
+#
+# Five upstream dependencies are gone with Vosk: `vosk` itself, `huggingface_hub` (it fetched
+# multi-gigabyte acoustic models into the customer's persistent storage), `srt`, `print_color` and
+# `requests`. Speech happens at Soniox over a websocket, so this container carries no model and needs
+# no ML runtime at all.
 aiortc
 av
 dotenv
-huggingface_hub
 nc_py_api>=0.24.0
 niquests
 numpy
-print_color
 pydantic
-requests
 ruamel.yaml
-srt
 # no pypi release since a long time
 supervisor @ git+https://github.com/Supervisor/supervisor.git@7b4190831a5162f5b26a72a039770ad4dfb5f6a2
 uvicorn
-vosk
 websockets
