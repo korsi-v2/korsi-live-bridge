@@ -31,6 +31,63 @@ jobs:
       - name: Download schema
         run: wget https://raw.githubusercontent.com/nextcloud/appstore/master/nextcloudappstore/api/v1/release/info.xsd
 
+      # The appstore schema lags AppAPI. `external-app/routes` is required by AppAPI -- with no routes
+      # declared, its proxy answers 404 to every request, so the app's admin page cannot work without
+      # it -- and the appstore's `external-app` type still lists only docker-install, scopes, system and
+      # environment-variables. Rather than drop the declaration or skip validation entirely, the schema
+      # is taught the element AppAPI documents, and everything else is still checked.
+      #
+      # Delete this step once `routes` appears in the upstream schema. To find out:
+      #   grep -c routes info.xsd
+      - name: Teach the schema about AppAPI's routes element
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          schema = Path("info.xsd")
+          text = schema.read_text(encoding="utf-8")
+          if "name=\"exapp-routes\"" in text or text.count("routes") > 1:
+              raise SystemExit("info.xsd already mentions routes; remove this workflow step")
+
+          anchor = (
+              '            <xs:element name="environment-variables" '
+              'type="environment-variables" minOccurs="0" maxOccurs="1"/>\n'
+          )
+          if anchor not in text:
+              raise SystemExit("info.xsd no longer has the expected external-app sequence")
+
+          text = text.replace(
+              anchor,
+              anchor
+              + '            <xs:element name="routes" type="exapp-routes" '
+              'minOccurs="0" maxOccurs="1"/>\n',
+              1,
+          )
+          text = text.replace(
+              '    <xs:complexType name="external-app">',
+              """    <xs:complexType name="exapp-routes">
+              <xs:sequence>
+                  <xs:element name="route" type="exapp-route" minOccurs="1" maxOccurs="unbounded"/>
+              </xs:sequence>
+          </xs:complexType>
+
+          <xs:complexType name="exapp-route">
+              <xs:all>
+                  <xs:element name="url" type="xs:string"/>
+                  <xs:element name="verb" type="xs:string"/>
+                  <xs:element name="access_level" type="xs:string"/>
+                  <xs:element name="headers_to_exclude" type="xs:string" minOccurs="0"/>
+                  <xs:element name="bruteforce_protection" type="xs:string" minOccurs="0"/>
+              </xs:all>
+          </xs:complexType>
+
+          <xs:complexType name="external-app">""".replace("\n          ", "\n    "),
+              1,
+          )
+          schema.write_text(text, encoding="utf-8")
+          print("added exapp-routes to info.xsd")
+          PY
+
       - name: Lint info.xml
         uses: ChristophWurst/xmllint-action@36f2a302f84f8c83fceea0b9c59e1eb4a616d3c1 # v1.2
         with:

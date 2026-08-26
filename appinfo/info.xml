@@ -22,7 +22,7 @@ Requirements: Nextcloud Talk with a High Performance Backend, and a Korsi tenant
 IMPORTANT: The environment variables below must be set in "Deploy Options", next to the "Deploy and Enable" button, before installing. The app refuses to enable without them rather than starting up and silently recording nothing.
 ]]>
 	</description>
-	<version>1.0.0</version>
+	<version>1.0.1</version>
 	<licence>agpl</licence>
 	<author mail="kyteinsky@gmail.com" homepage="https://github.com/kyteinsky">Anupam Kumar</author>
 	<author mail="mklehr@gmx.net" homepage="https://github.com/marcelklehr">Marcel Klehr</author>
@@ -40,7 +40,7 @@ IMPORTANT: The environment variables below must be set in "Deploy Options", next
 		<docker-install>
 			<registry>ghcr.io</registry>
 			<image>korsi-v2/korsi-live-bridge</image>
-			<image-tag>1.0.0</image-tag>
+			<image-tag>1.0.1</image-tag>
 		</docker-install>
 		<environment-variables>
 			<variable>
@@ -71,7 +71,7 @@ IMPORTANT: The environment variables below must be set in "Deploy Options", next
 			<variable>
 				<name>KORSI_SERVICE_KEY</name>
 				<display-name>Korsi service key</display-name>
-				<description>The JSON key document Korsi provided, on a single line. The bridge signs a short-lived assertion with it to obtain access tokens, so the private key never leaves this server. Korsi cannot show it again — ask for a new one if it is lost.</description>
+				<description>The key Korsi provided. Prefer the base64 form: it is a single unbroken string, so nothing between here and the container can damage it. The raw JSON document works too, on one line, but some deployment platforms escape the line breaks inside it — the bridge repairs that and says so on its admin page. The bridge signs a short-lived assertion with this key to obtain access tokens, so the private half never leaves this server. Korsi cannot show it again; ask for a new one if it is lost.</description>
 			</variable>
 			<variable>
 				<name>SKIP_CERT_VERIFY</name>
@@ -79,5 +79,45 @@ IMPORTANT: The environment variables below must be set in "Deploy Options", next
 				<description>When set to "true" or "1", certificate verification is skipped for the websocket connections to the HPB. For test deployments with self-signed certificates only.</description>
 			</variable>
 		</environment-variables>
+		<!--
+		  - Which of this app's routes a browser may reach through AppAPI's proxy. Not the routes the
+		  - app has: AppAPI talks to the container directly, so `/enabled`, `/heartbeat` and the
+		  - lifecycle endpoints are deliberately absent. Nothing undeclared is reachable, and with no
+		  - `routes` element at all AppAPI answers 404 to everything, which is why the admin page
+		  - cannot work without this block.
+		  -
+		  - The url is a regex matched against the request path including its leading slash, anchored at
+		  - the start only. Hence the trailing `$`: without it, `^/api/v1/logs` would also match a
+		  - route added later under the same prefix and quietly grant it the same access.
+		  -
+		  - All ADMIN. Every one of these describes the tenant's configuration or the bridge's own log,
+		  - which is not something an ordinary Nextcloud user should be able to read.
+		  -->
+		<routes>
+			<route>
+				<url>^/api/v1/status$</url>
+				<verb>GET</verb>
+				<access_level>ADMIN</access_level>
+				<headers_to_exclude>[]</headers_to_exclude>
+			</route>
+			<route>
+				<url>^/api/v1/selftest$</url>
+				<verb>POST</verb>
+				<access_level>ADMIN</access_level>
+				<headers_to_exclude>[]</headers_to_exclude>
+			</route>
+			<route>
+				<url>^/api/v1/logs$</url>
+				<verb>GET</verb>
+				<access_level>ADMIN</access_level>
+				<headers_to_exclude>[]</headers_to_exclude>
+			</route>
+			<route>
+				<url>^/(js|css)/[A-Za-z0-9_.-]+$</url>
+				<verb>GET</verb>
+				<access_level>ADMIN</access_level>
+				<headers_to_exclude>[]</headers_to_exclude>
+			</route>
+		</routes>
 	</external-app>
 </info>

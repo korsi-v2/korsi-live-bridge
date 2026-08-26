@@ -1,0 +1,245 @@
+/*
+ * SPDX-FileCopyrightText: 2026 Pishrun and Korsi contributors
+ * SPDX-License-Identifier: AGPL-3.0-or-later
+ *
+ * Nextcloud's own custom properties throughout, and no colour that is not one of them. The page lives
+ * inside the host Nextcloud, which may be in dark mode, in a custom theme, or right-to-left, and none
+ * of those are things this app gets to have an opinion about.
+ *
+ * Status is never carried by colour alone: every check also renders a mark and a screen-reader-only
+ * word, because "which of these seven lines is the red one" is not a question a colour-blind
+ * administrator should have to answer.
+ */
+
+.korsi-health {
+	max-width: 60em;
+	margin: 0 auto;
+	padding: 2rem 1.5rem 4rem;
+	color: var(--color-main-text);
+}
+
+.korsi-health h2 {
+	font-size: 1.5rem;
+	font-weight: 600;
+	margin-bottom: 0.5rem;
+}
+
+.korsi-health h3 {
+	font-size: 1.1rem;
+	font-weight: 600;
+	margin: 0 0 0.75rem;
+}
+
+.korsi-health h4 {
+	font-size: 1rem;
+	font-weight: 600;
+	margin: 1rem 0 0.5rem;
+}
+
+.korsi-lede,
+.korsi-muted {
+	color: var(--color-text-maxcontrast);
+	line-height: 1.5;
+}
+
+.korsi-lede {
+	max-width: 46em;
+	margin-bottom: 2rem;
+}
+
+.korsi-section {
+	margin-bottom: 2.5rem;
+	padding: 1.25rem;
+	background-color: var(--color-main-background);
+	border: 1px solid var(--color-border);
+	border-radius: var(--border-radius-large, 8px);
+}
+
+/* ---------------------------------------------------------------- checks */
+
+.korsi-checks {
+	list-style: none;
+	margin: 1rem 0;
+	padding: 0;
+}
+
+.korsi-checks li {
+	display: flex;
+	gap: 0.75rem;
+	padding: 0.75rem 0;
+	border-top: 1px solid var(--color-border);
+}
+
+.korsi-checks li:first-child {
+	border-top: none;
+}
+
+.korsi-mark {
+	flex: 0 0 1.5rem;
+	font-size: 1.1rem;
+	line-height: 1.5;
+	text-align: center;
+}
+
+.korsi-check-body {
+	flex: 1 1 auto;
+	min-width: 0;
+}
+
+.korsi-check-body strong {
+	text-transform: capitalize;
+}
+
+.korsi-check-body p {
+	margin: 0.25rem 0 0;
+	line-height: 1.5;
+	overflow-wrap: anywhere;
+}
+
+.korsi-ok .korsi-mark {
+	color: var(--color-success, #2d7b2d);
+}
+
+.korsi-bad .korsi-mark {
+	color: var(--color-error, #c33);
+}
+
+.korsi-skip .korsi-mark,
+.korsi-skip .korsi-check-body {
+	color: var(--color-text-maxcontrast);
+}
+
+.korsi-bad-text {
+	color: var(--color-error, #c33);
+	line-height: 1.5;
+}
+
+.korsi-warn-text {
+	color: var(--color-warning-text, var(--color-main-text));
+	background-color: var(--color-warning-hover, var(--color-background-hover));
+	border-inline-start: 4px solid var(--color-warning, #c9a227);
+	padding: 0.75rem 1rem;
+	border-radius: var(--border-radius, 4px);
+	line-height: 1.5;
+}
+
+/* Visible to assistive technology, not on screen: the word that says what the mark means. */
+.korsi-sr {
+	position: absolute;
+	width: 1px;
+	height: 1px;
+	overflow: hidden;
+	clip: rect(0 0 0 0);
+	white-space: nowrap;
+}
+
+/* ---------------------------------------------------------------- tables */
+
+.korsi-kv {
+	width: 100%;
+	border-collapse: collapse;
+}
+
+.korsi-kv th,
+.korsi-kv td {
+	text-align: start;
+	padding: 0.4rem 0.75rem 0.4rem 0;
+	vertical-align: top;
+	border-bottom: 1px solid var(--color-border);
+	overflow-wrap: anywhere;
+}
+
+.korsi-kv th {
+	font-weight: 400;
+	color: var(--color-text-maxcontrast);
+	width: 14em;
+}
+
+.korsi-key {
+	margin-top: 1.5rem;
+}
+
+.korsi-problems {
+	margin: 0.5rem 0 0 1.25rem;
+	line-height: 1.6;
+}
+
+/* ---------------------------------------------------------------- controls */
+
+.korsi-button {
+	margin-top: 1rem;
+}
+
+.korsi-log-controls {
+	display: flex;
+	align-items: center;
+	gap: 0.75rem;
+	flex-wrap: wrap;
+	margin-bottom: 1rem;
+}
+
+.korsi-log-controls label {
+	color: var(--color-text-maxcontrast);
+}
+
+/* ---------------------------------------------------------------- log */
+
+.korsi-log {
+	list-style: none;
+	margin: 0;
+	padding: 0.75rem;
+	max-height: 30rem;
+	overflow: auto;
+	background-color: var(--color-background-dark);
+	border-radius: var(--border-radius, 4px);
+	font-family: var(--font-face-monospace, monospace);
+	font-size: 0.8125rem;
+	line-height: 1.6;
+	/* The log is machine output: left-to-right even when the surrounding UI is not. */
+	direction: ltr;
+	text-align: left;
+}
+
+.korsi-log li {
+	display: grid;
+	grid-template-columns: 10.5rem 5rem 1fr;
+	gap: 0.5rem;
+	padding: 0.2rem 0;
+	overflow-wrap: anywhere;
+}
+
+.korsi-log time,
+.korsi-log-level {
+	color: var(--color-text-maxcontrast);
+}
+
+.korsi-log-extra {
+	grid-column: 3;
+	color: var(--color-text-maxcontrast);
+}
+
+.korsi-level-warning .korsi-log-level,
+.korsi-level-warning .korsi-log-message {
+	color: var(--color-warning-text, var(--color-main-text));
+}
+
+.korsi-level-error .korsi-log-level,
+.korsi-level-error .korsi-log-message,
+.korsi-level-critical .korsi-log-level,
+.korsi-level-critical .korsi-log-message {
+	color: var(--color-error-text, var(--color-error, #c33));
+}
+
+@media (max-width: 40em) {
+	.korsi-log li {
+		grid-template-columns: 1fr;
+	}
+
+	.korsi-log-extra {
+		grid-column: 1;
+	}
+
+	.korsi-kv th {
+		width: auto;
+	}
+}

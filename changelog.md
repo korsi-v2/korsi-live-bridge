@@ -8,6 +8,35 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](http://keepachangelog.com/)
 and this project adheres to [Semantic Versioning](http://semver.org/).
 
+## 1.0.1
+
+Everything here is about one failure: the bridge was deployed with a correct service key, could not
+mint a token, and said nothing an administrator could act on.
+
+### Fixed
+- `KORSI_SERVICE_KEY` is accepted as base64 as well as raw JSON, and the base64 form is now what
+  `provision-bridge` prints. Deployment platforms escape the backslashes in a JSON value, which turns
+  every line break inside the PEM into the two characters `\` and `n` — valid JSON, correct fields,
+  both markers present, and a key `cryptography` refuses. Base64 has nothing left to escape.
+- A damaged PEM is repaired rather than rejected: escape sequences are undone, non-base64 characters
+  dropped and the body re-wrapped. This also covers a key collapsed onto one line and CRLF endings.
+  The repair is reported, because a value damaged once is damaged again on the next deploy.
+- The configuration check now loads the private key and signs with it instead of looking for `BEGIN`
+  and `END`. The realistic failure has both markers, which is why it was invisible.
+- The credentials error no longer names `KORSI_CLIENT_ID` and `KORSI_CLIENT_SECRET`, which stopped
+  existing when the bridge moved to the JWT-profile grant.
+
+### Added
+- An admin page in Nextcloud's app menu, for administrators only. It runs a self-test, shows what the
+  bridge is doing and tails its log, so "no live analysis" can be diagnosed without the Docker socket.
+- `POST /api/v1/selftest` walks every step between "the app is enabled" and "Korsi is listening" and
+  reports each one separately. Including whether the access token carries the `service_account` role:
+  a token with no roles is issued successfully, refused by Korsi for an unrelated-looking reason, and
+  was previously impossible to see.
+- `GET /api/v1/logs` returns recent records from the container's log file.
+- `<routes>` in `appinfo/info.xml`, which AppAPI requires before a browser may reach any of the above
+  through its proxy. All ADMIN.
+
 ## 1.0.0 - Korsi Live Meeting Bridge
 
 Forked from `nextcloud/live_transcription` 2.1.3 and repurposed: instead of showing captions to the

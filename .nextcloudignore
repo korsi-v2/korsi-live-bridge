@@ -41,6 +41,7 @@
 /requirements.txt
 /Dockerfile
 /results
+/ex_app/css
 /ex_app/js
 /ex_app/lib
 /ex_app/src

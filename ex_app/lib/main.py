@@ -15,6 +15,7 @@ Korsi. Nothing in the Talk UI turns it on or off, because for Korsi's customers 
 an opt-in per meeting.
 """
 
+import asyncio
 import logging
 import os
 from contextlib import asynccontextmanager, suppress
@@ -36,9 +37,11 @@ if __skip_cert_verify in ("true", "1"):
 # isort: on
 
 import uvicorn
-from fastapi import FastAPI
+from diagnostics import MAX_LOG_LINES, self_test, tail_log
+from fastapi import FastAPI, Query
 from fastapi.responses import JSONResponse
 from fastapi.routing import APIRouter
+from fastapi.staticfiles import StaticFiles
 from logger import get_logging_config, setup_logging
 from nc_py_api import AsyncNextcloudApp, NextcloudApp
 from nc_py_api.ex_app import AppAPIAuthMiddleware, run_app, set_handlers, setup_nextcloud_logging
@@ -49,6 +52,14 @@ LOGGER_CONFIG_NAME = "../../logger_config.yaml"
 LOGGER = logging.getLogger("lt")
 SERVICE: Application
 ENABLED = Event()
+
+#: Where the admin page's assets live, resolved from this file rather than from the working directory:
+#: the container starts in `/ex_app/lib`, but the tests and a local run do not.
+ASSETS = Path(__file__).resolve().parent.parent
+
+#: The name of the bridge's entry in Nextcloud's app menu. Also the key AppAPI uses to look up which
+#: scripts and styles belong to that page, so the three registrations below have to agree on it.
+ADMIN_PAGE = "health"
 
 # No models to fetch. Upstream downloads Vosk models into persistent storage on install -- gigabytes
 # per language, on the customer's disk, with a pinned revision to keep in step. Speech happens at
@@ -107,12 +118,44 @@ async def get_enabled():
 async def get_status():
 	status = SERVICE.status()
 	status["enabled"] = ENABLED.is_set()
-	# Reports which variables are missing, never their values: two of them are secrets.
+	status["version"] = os.environ.get("APP_VERSION")
+	# Reports what is wrong with the configuration, never a value: two of these are secrets.
 	status["missing_configuration"] = check_korsi_env_vars()
 	return status
 
 
+@ROUTER_V1.post("/selftest",
+	description=(
+		"Walk every step between 'the app is enabled' and 'Korsi is listening', and report each one."
+		" A POST because it is not a read: it mints an access token and calls Korsi."
+	),
+	responses={200: {"description": "One result per step, in the order the bridge performs them."}},
+)
+async def post_selftest():
+	return await self_test()
+
+
+@ROUTER_V1.get("/logs",
+	description=(
+		"The bridge's own recent log records, newest last. Reads the container's log file, so an"
+		" administrator does not need the Docker socket to see why a meeting was not read."
+	),
+	responses={200: {"description": "Recent log records."}},
+)
+async def get_logs(
+	lines: int = Query(default=100, ge=1, le=MAX_LOG_LINES),
+	min_level: str = Query(default="INFO"),
+):
+	return await asyncio.to_thread(tail_log, lines=lines, min_level=min_level)
+
+
 APP.include_router(ROUTER_V1)
+
+# Served for the admin page AppAPI renders, which rewrites this app's script and style tags to go
+# through its proxy. Two narrow mounts rather than one over `ex_app`, because that directory also holds
+# `lib`, and a static mount over the source tree is how a settings page starts serving `korsi_client.py`.
+APP.mount("/js", StaticFiles(directory=ASSETS / "js"), name="js")
+APP.mount("/css", StaticFiles(directory=ASSETS / "css"), name="css")
 
 
 # until capabilities is supported in nc_py_api
@@ -151,6 +194,8 @@ def enabled_handler(enabled: bool, nc: NextcloudApp | AsyncNextcloudApp) -> str:
 		)
 
 	ENABLED.set()
+	if isinstance(nc, NextcloudApp):
+		_register_admin_page(nc)
 	try:
 		SERVICE.hpb_settings = get_hpb_settings()
 	except Exception as e:
@@ -160,6 +205,25 @@ def enabled_handler(enabled: bool, nc: NextcloudApp | AsyncNextcloudApp) -> str:
 			" Backend configured before this bridge can listen to calls."
 		)
 	return ""
+
+
+def _register_admin_page(nc: NextcloudApp) -> None:
+	"""Put the bridge in Nextcloud's app menu, for administrators only.
+
+	Not a declarative settings form, which is what an ExApp would normally use for configuration. There
+	is nothing here to configure -- every setting is a deploy option, because the container is restarted
+	to change one -- and what an administrator actually needs is the opposite of a form: a self-test and
+	a log, on a page big enough to read them.
+
+	Failures are logged and swallowed. A menu entry that could not be registered is a page nobody can
+	open; refusing to enable the app over it would trade a missing diagnostic page for no bridge at all.
+	"""
+	try:
+		nc.ui.top_menu.register(ADMIN_PAGE, "Korsi live bridge", admin_required=True)
+		nc.ui.resources.set_script("top_menu", ADMIN_PAGE, "js/korsi-health")
+		nc.ui.resources.set_style("top_menu", ADMIN_PAGE, "css/korsi-health")
+	except Exception as e:  # noqa: BLE001 - a missing diagnostics page must not block the bridge
+		LOGGER.warning("Could not register the admin page", exc_info=e, extra={"tag": "application"})
 
 
 if __name__ == "__main__":
