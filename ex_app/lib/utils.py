@@ -122,6 +122,14 @@ def check_korsi_env_vars() -> list[str]:
 			absent = [f for f in ("keyId", "userId", "key") if not parsed.get(f)]
 			if absent:
 				missing.append(f"KORSI_SERVICE_KEY (missing {', '.join(absent)})")
+			# Truncation is the realistic pasting accident: the key is a multi-line PEM being
+			# put into a single-line form field. Checking both markers catches a value that
+			# has the right fields and half a key, which otherwise fails at the first token
+			# request rather than when the app is enabled.
+			elif not (
+				"-----BEGIN" in parsed["key"] and "-----END" in parsed["key"]
+			):
+				missing.append("KORSI_SERVICE_KEY (the key looks truncated)")
 
 	# The roles assertion is the one reserved scope whose absence produces a working token that
 	# is refused by korsi-api for an unrelated-looking reason. Worth naming before that happens.

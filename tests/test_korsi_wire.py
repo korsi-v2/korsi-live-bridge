@@ -317,3 +317,34 @@ async def test_missing_roles_scope_is_named_before_it_causes_a_refusal(monkeypat
 	problems = check_korsi_env_vars()
 
 	assert any("projects:roles" in problem for problem in problems)
+
+
+async def test_a_truncated_key_is_reported_before_the_first_call(monkeypatch):
+	"""The realistic pasting accident: a multi-line PEM into a one-line form field."""
+	from utils import check_korsi_env_vars
+
+	for name, value in {
+		"KORSI_API_URL": "https://api.example.test",
+		"KORSI_TOKEN_URL": "https://auth.example.test/oauth/v2/token",
+		"KORSI_TOKEN_SCOPE": "openid urn:zitadel:iam:org:projects:roles",
+		"KORSI_SERVICE_KEY": json.dumps(
+			{"keyId": "k", "userId": "u", "key": "-----BEGIN RSA PRIVATE KEY-----\nMIIEow"}
+		),
+	}.items():
+		monkeypatch.setenv(name, value)
+
+	assert any("truncated" in problem for problem in check_korsi_env_vars())
+
+
+async def test_a_whole_key_passes_the_check(monkeypatch):
+	from utils import check_korsi_env_vars
+
+	for name, value in {
+		"KORSI_API_URL": "https://api.example.test",
+		"KORSI_TOKEN_URL": "https://auth.example.test/oauth/v2/token",
+		"KORSI_TOKEN_SCOPE": "openid urn:zitadel:iam:org:projects:roles",
+		"KORSI_SERVICE_KEY": json.dumps({"keyId": "k", "userId": "u", "key": _TEST_KEY}),
+	}.items():
+		monkeypatch.setenv(name, value)
+
+	assert check_korsi_env_vars() == []
