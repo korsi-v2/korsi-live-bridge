@@ -61,7 +61,7 @@ IMPORTANT: The environment variables below must be set in "Deploy Options", next
 			<variable>
 				<name>KORSI_TOKEN_URL</name>
 				<display-name>Korsi token endpoint</display-name>
-				<description>OAuth2 token endpoint of Korsi's identity provider, for example "https://auth.korsi.ai/oauth/v2/token". The bridge exchanges its client credentials here for an access token.</description>
+				<description>OAuth2 token endpoint of Korsi's identity provider, for example "https://auth.korsi.ai/oauth/v2/token". The bridge signs a short-lived assertion with its service key and exchanges it here for an access token.</description>
 			</variable>
 			<variable>
 				<name>KORSI_TOKEN_SCOPE</name>
