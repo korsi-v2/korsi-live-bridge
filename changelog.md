@@ -8,6 +8,21 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](http://keepachangelog.com/)
 and this project adheres to [Semantic Versioning](http://semver.org/).
 
+## 1.0.2
+
+### Fixed
+- HTTP/3 is never negotiated. `niquests` — which this app and `nc_py_api` both use — upgrades to
+  HTTP/3 when a server advertises it through `Alt-Svc`, and does not fall back when the
+  advertisement is wrong: it raises `MustDowngradeError` and the request fails, on every retry.
+  A reverse proxy advertising `h3` with UDP/443 closed therefore broke both sides at once — the
+  watchlist poll to korsi-api and the admin page's registration call to Nextcloud — while the bridge
+  minted its token and reported that it was watching for calls. Advertising `h3` without serving it
+  is a server-side fault and it is still the bridge's to survive: this app is installed in a
+  customer's infrastructure and talks to whatever proxy they run.
+- A failing request no longer reports a gateway's answer as though korsi-api had given it. korsi-api
+  names every error it raises, so a status with no `code` did not come from korsi-api — it means
+  korsi-api is not serving rather than refusing, which is a different problem with a different owner.
+
 ## 1.0.1
 
 Everything here is about one failure: the bridge was deployed with a correct service key, could not

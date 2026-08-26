@@ -22,7 +22,7 @@ Requirements: Nextcloud Talk with a High Performance Backend, and a Korsi tenant
 IMPORTANT: The environment variables below must be set in "Deploy Options", next to the "Deploy and Enable" button, before installing. The app refuses to enable without them rather than starting up and silently recording nothing.
 ]]>
 	</description>
-	<version>1.0.1</version>
+	<version>1.0.2</version>
 	<licence>agpl</licence>
 	<author mail="kyteinsky@gmail.com" homepage="https://github.com/kyteinsky">Anupam Kumar</author>
 	<author mail="mklehr@gmx.net" homepage="https://github.com/marcelklehr">Marcel Klehr</author>
@@ -40,7 +40,7 @@ IMPORTANT: The environment variables below must be set in "Deploy Options", next
 		<docker-install>
 			<registry>ghcr.io</registry>
 			<image>korsi-v2/korsi-live-bridge</image>
-			<image-tag>1.0.1</image-tag>
+			<image-tag>1.0.2</image-tag>
 		</docker-install>
 		<environment-variables>
 			<variable>

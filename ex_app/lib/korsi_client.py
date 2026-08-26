@@ -42,7 +42,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 import jwt as pyjwt
-import niquests
+from http_transport import AsyncSession
 from korsi_types import (
 	KorsiApiError,
 	LiveCloseReason,
@@ -121,7 +121,7 @@ class KorsiClient:
 		self._token: str | None = None
 		self._token_expires_at: float = 0.0
 		self._token_lock = asyncio.Lock()
-		self._session: niquests.AsyncSession | None = None
+		self._session: AsyncSession | None = None
 
 	async def aclose(self) -> None:
 		if self._session is not None:
@@ -132,9 +132,15 @@ class KorsiClient:
 			except Exception as e:  # noqa: BLE001 - shutdown path, nothing to escalate to
 				LOGGER.debug("Error closing the Korsi HTTP session", exc_info=e, extra={"tag": "korsi"})
 
-	async def _http(self) -> niquests.AsyncSession:
+	async def _http(self) -> AsyncSession:
+		"""The session every call to korsi-api goes through.
+
+		`http_transport.AsyncSession` rather than niquests' own, so HTTP/3 is never negotiated. See
+		that module: a proxy advertising `h3` it cannot serve makes every request fail outright, and
+		this bridge does not get to choose the proxy in front of Korsi.
+		"""
 		if self._session is None:
-			self._session = niquests.AsyncSession()
+			self._session = AsyncSession()
 		return self._session
 
 	# ------------------------------------------------------------------ auth

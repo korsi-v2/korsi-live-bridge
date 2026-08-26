@@ -30,6 +30,12 @@ from livetypes import SpreedClientException
 from dotenv import load_dotenv
 load_dotenv()
 
+# Before anything builds a Nextcloud session. A reverse proxy that advertises HTTP/3 it cannot serve
+# makes every request fail with `MustDowngradeError`, and this is what stops that -- see
+# `http_transport` for why surviving somebody else's proxy is the bridge's problem.
+from http_transport import install as _disable_http3
+_disable_http3()
+
 # skip certificate verification for all nc_py_api connections if env var is set
 __skip_cert_verify = os.environ.get("SKIP_CERT_VERIFY", "false").lower()
 if __skip_cert_verify in ("true", "1"):
