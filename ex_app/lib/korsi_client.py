@@ -37,6 +37,7 @@ import logging
 import os
 import re
 import time
+from contextlib import suppress
 from datetime import UTC, datetime
 from typing import Any
 
@@ -301,20 +302,46 @@ class KorsiClient:
 		The `code` matters more than the status: `live.session_closed` arrives as a 409, and 409 on
 		its own would read as "conflict, try again" when the correct response is to stop transcribing
 		this call.
+
+		**A body that is not a problem document is reported as exactly that.** korsi-api always names
+		its errors -- every one of them carries a `code` -- so a status with no code did not come from
+		korsi-api. It came from whatever sits in front of it, which means korsi-api is not serving
+		rather than refusing. Those are different problems with different owners, and the earlier
+		version of this method rendered the second as `503 unknown:`, which reads like Korsi answered
+		unhelpfully instead of like Korsi never answered.
 		"""
 		code = ""
 		title = ""
+		parsed = False
 		try:
 			problem = response.json()
 			if isinstance(problem, dict):
+				parsed = True
 				code = str(problem.get("code", ""))
 				title = str(problem.get("title", ""))
-		except Exception:  # noqa: BLE001, S110 - a proxy's HTML error page is still an error
-			# Deliberately not logged: the status line below carries everything actionable, and a
-			# gateway's error page in the log adds a screenful of markup per failure.
+		except Exception:  # noqa: BLE001, S110 - a gateway's HTML error page is still an error
+			# The body itself is not logged. A gateway error page is a screenful of markup per
+			# failure, and the sentence built below carries everything that can be acted on.
 			pass
 
-		message = f"{method} {path} -> {status} {code or 'unknown'}: {title}".strip()
+		if code:
+			message = f"{method} {path} -> {status} {code}: {title}".strip()
+		else:
+			# Named rather than blamed on Korsi: the content type is what tells an operator whether
+			# they are looking at a reverse proxy, a load balancer or a captive portal.
+			content_type = ""
+			with suppress(Exception):
+				content_type = str(response.headers.get("content-type", ""))
+			if parsed:
+				shape = "JSON without a code"
+			else:
+				shape = f"a {content_type} body" if content_type else "a body of no stated type"
+			message = (
+				f"{method} {path} -> {status}, and the response is {shape} rather than one of"
+				" korsi-api's error documents. Something in front of korsi-api answered, so"
+				" korsi-api is most likely not running or not healthy."
+			)
+
 		if code in _SESSION_GONE_CODES:
 			return LiveSessionClosed(message, status=status)
 		return KorsiApiError(message, status=status)
