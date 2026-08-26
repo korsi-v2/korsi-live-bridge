@@ -11,22 +11,36 @@ reaches into a customer's Nextcloud. Anything the bridge needs to know it asks f
 (`/internal/v1`, `/shared/v1`, `/management/v1`) and each is a separate thing to reason about when
 auditing who can reach what. A fourth one for this bridge would be a new security surface for a
 client that ZITADEL can already issue a perfectly ordinary token to, whose service-account role grants
-exactly `meeting.read` / `meeting.ingest` and nothing else. See ADR-0021 D4.
+exactly `meeting.read` / `meeting.ingest` / `meeting.analyze` and nothing else. See ADR-0021 D4.
 
-**The scope string is configuration, not code.** The token has to be addressed to korsi-api's audience
-or the roles arrive in a claim korsi-api does not read, and expressing that means ZITADEL URN syntax
-(`urn:zitadel:iam:org:project:id:<id>:aud`). Building that here would put Korsi's identity-provider
-topology inside every customer's infrastructure, to be redeployed the day it changes. So Korsi's
-provisioning emits the finished string and the bridge pastes it into a token request. Section 2 of the
-design doc: the bridge holds no policy.
+**JWT-profile, not client credentials, and this is not a preference.** ZITADEL does not assert project
+roles into a token obtained through `client_credentials`: the token comes back valid, correctly
+addressed to korsi-api, and carrying no `urn:zitadel:iam:org:project:<id>:roles` claim at all. korsi-api
+reads roles from the token alone -- deliberately, so that revoking a role cannot be outvoted by a stale
+database row -- so such a token resolves to a principal with no permissions and every call is refused as
+forbidden, with nothing in the failure pointing at the cause. The JWT-profile grant does assert them.
+Verified against ZITADEL v4.16 by trying both.
+
+The practical benefit is that the private key never leaves this container: there is no shared secret in
+flight on each token request, only a short-lived assertion signed with a key Korsi cannot read back.
+
+**The scope string is configuration, not code.** Three reserved URNs have to be present -- the API
+audience, the roles assertion and the acting organization -- and each omission fails somewhere far from
+its cause. Composing them here would put Korsi's identity-provider topology inside every customer's
+infrastructure, to be redeployed the day it changes. Korsi's `provision-bridge` emits the finished
+string; the bridge pastes it into a token request and holds no opinion about it. Section 2 of the design
+doc: the bridge holds no policy.
 """
 
 import asyncio
+import json
 import logging
 import os
+import time
 from datetime import UTC, datetime
 from typing import Any
 
+import jwt as pyjwt
 import niquests
 from korsi_types import (
 	KorsiApiError,
@@ -73,9 +87,24 @@ class KorsiClient:
 	def __init__(self) -> None:
 		self._base_url = os.environ["KORSI_API_URL"].rstrip("/")
 		self._token_url = os.environ["KORSI_TOKEN_URL"]
-		self._client_id = os.environ["KORSI_CLIENT_ID"]
-		self._client_secret = os.environ["KORSI_CLIENT_SECRET"]
 		self._scope = os.environ["KORSI_TOKEN_SCOPE"]
+
+		# The service key ZITADEL generated, as the JSON document `provision-bridge` printed.
+		# Parsed at construction so a malformed value fails when the app is enabled rather
+		# than in the middle of the first call somebody cared about.
+		key = json.loads(os.environ["KORSI_SERVICE_KEY"])
+		try:
+			self._key_id: str = key["keyId"]
+			self._user_id: str = key["userId"]
+			self._private_key: str = key["key"]
+		except KeyError as exc:
+			msg = f"KORSI_SERVICE_KEY is missing {exc}; paste the value provision-bridge printed"
+			raise ValueError(msg) from exc
+
+		#: The assertion's audience is the identity provider, not korsi-api: it is addressed to
+		#: whoever will exchange it, and the token that comes back is what carries korsi-api's
+		#: audience. Derived from the token endpoint so there is one fewer setting to get wrong.
+		self._issuer = self._token_url.split("/oauth/", 1)[0]
 
 		self._token: str | None = None
 		self._token_expires_at: float = 0.0
@@ -115,9 +144,8 @@ class KorsiClient:
 				response = await http.post(
 					self._token_url,
 					data={
-						"grant_type": "client_credentials",
-						"client_id": self._client_id,
-						"client_secret": self._client_secret,
+						"grant_type": "urn:ietf:params:oauth:grant-type:jwt-bearer",
+						"assertion": self._assertion(),
 						"scope": self._scope,
 					},
 					headers={"Content-Type": "application/x-www-form-urlencoded"},
@@ -146,6 +174,26 @@ class KorsiClient:
 				"tag": "korsi",
 			})
 			return self._token
+
+	def _assertion(self) -> str:
+		"""A short-lived JWT proving this bridge holds the service key.
+
+		One minute of validity, because it is exchanged immediately and never stored. A long
+		expiry would only widen the window in which a captured assertion is replayable.
+		"""
+		now = int(time.time())
+		return pyjwt.encode(
+			{
+				"iss": self._user_id,
+				"sub": self._user_id,
+				"aud": self._issuer,
+				"iat": now,
+				"exp": now + 60,
+			},
+			self._private_key,
+			algorithm="RS256",
+			headers={"kid": self._key_id},
+		)
 
 	def forget_token(self) -> None:
 		"""Drop the cached token so the next call mints a fresh one.

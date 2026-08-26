@@ -22,6 +22,27 @@ from korsi_types import LiveCloseReason
 
 jsonschema = pytest.importorskip("jsonschema")
 
+
+def _generate_key() -> str:
+	"""An RSA key for the assertion tests.
+
+	Generated per run rather than committed. A fixture private key in a repository is a
+	credential-shaped thing that eventually gets copied somewhere it matters, and a secret
+	scanner flagging it is the good outcome.
+	"""
+	from cryptography.hazmat.primitives import serialization
+	from cryptography.hazmat.primitives.asymmetric import rsa
+
+	key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+	return key.private_bytes(
+		encoding=serialization.Encoding.PEM,
+		format=serialization.PrivateFormat.TraditionalOpenSSL,
+		encryption_algorithm=serialization.NoEncryption(),
+	).decode()
+
+
+_TEST_KEY = _generate_key()
+
 OPENAPI = Path(__file__).resolve().parents[2] / "korsi-api" / "openapi.json"
 pytestmark = pytest.mark.skipif(not OPENAPI.is_file(), reason="korsi-api/openapi.json not available")
 
@@ -55,9 +76,13 @@ def client(monkeypatch) -> KorsiClient:
 	for name, value in {
 		"KORSI_API_URL": "https://api.example.test",
 		"KORSI_TOKEN_URL": "https://auth.example.test/oauth/v2/token",
-		"KORSI_CLIENT_ID": "bridge",
-		"KORSI_CLIENT_SECRET": "secret",
-		"KORSI_TOKEN_SCOPE": "openid urn:zitadel:iam:org:project:id:x:aud",
+		"KORSI_TOKEN_SCOPE": (
+			"openid urn:zitadel:iam:org:project:id:x:aud "
+			"urn:zitadel:iam:org:projects:roles urn:zitadel:iam:org:id:y"
+		),
+		"KORSI_SERVICE_KEY": json.dumps(
+			{"type": "serviceaccount", "keyId": "k1", "userId": "u1", "key": _TEST_KEY}
+		),
 	}.items():
 		monkeypatch.setenv(name, value)
 	return KorsiClient()
@@ -224,3 +249,71 @@ async def test_unknown_response_fields_do_not_break_the_bridge(client, monkeypat
 
 	assert watchlist.poll_interval_seconds == 45
 	assert watchlist.rooms[0].room_remote_id == "abc"
+
+
+# ------------------------------------------------------------------ authentication
+
+
+async def test_the_assertion_is_signed_with_the_service_key(client):
+	"""What the bridge sends to the token endpoint, and why each claim is there.
+
+	Not client credentials: ZITADEL does not assert project roles into a `client_credentials`
+	token, so korsi-api would see a valid token with no permissions.
+	"""
+	import jwt as pyjwt
+	from cryptography.hazmat.primitives import serialization
+
+	assertion = client._assertion()
+
+	public = (
+		serialization.load_pem_private_key(_TEST_KEY.encode(), password=None)
+		.public_key()
+		.public_bytes(
+			encoding=serialization.Encoding.PEM,
+			format=serialization.PublicFormat.SubjectPublicKeyInfo,
+		)
+	)
+	claims = pyjwt.decode(
+		assertion, public, algorithms=["RS256"], audience="https://auth.example.test"
+	)
+
+	assert claims["iss"] == "u1"
+	assert claims["sub"] == "u1"
+	# Addressed to the identity provider, which is what exchanges it. korsi-api's audience is
+	# carried by the token that comes back, not by this.
+	assert claims["aud"] == "https://auth.example.test"
+	# Short-lived: it is exchanged immediately, so a longer life would only widen the replay
+	# window.
+	assert 0 < claims["exp"] - claims["iat"] <= 60
+	assert pyjwt.get_unverified_header(assertion)["kid"] == "k1"
+
+
+async def test_a_malformed_service_key_fails_at_construction(monkeypatch):
+	"""Reported when the app is enabled, not in the middle of the first meeting."""
+	for name, value in {
+		"KORSI_API_URL": "https://api.example.test",
+		"KORSI_TOKEN_URL": "https://auth.example.test/oauth/v2/token",
+		"KORSI_TOKEN_SCOPE": "openid",
+		"KORSI_SERVICE_KEY": json.dumps({"type": "serviceaccount"}),
+	}.items():
+		monkeypatch.setenv(name, value)
+
+	with pytest.raises(ValueError, match="KORSI_SERVICE_KEY"):
+		KorsiClient()
+
+
+async def test_missing_roles_scope_is_named_before_it_causes_a_refusal(monkeypatch):
+	"""The one misconfiguration whose symptom points nowhere near its cause."""
+	from utils import check_korsi_env_vars
+
+	for name, value in {
+		"KORSI_API_URL": "https://api.example.test",
+		"KORSI_TOKEN_URL": "https://auth.example.test/oauth/v2/token",
+		"KORSI_SERVICE_KEY": json.dumps({"keyId": "k", "userId": "u", "key": "x"}),
+		"KORSI_TOKEN_SCOPE": "openid urn:zitadel:iam:org:project:id:x:aud",
+	}.items():
+		monkeypatch.setenv(name, value)
+
+	problems = check_korsi_env_vars()
+
+	assert any("projects:roles" in problem for problem in problems)

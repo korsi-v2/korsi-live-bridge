@@ -5,6 +5,7 @@
 
 import hashlib
 import hmac
+import json
 import logging
 import os
 import re
@@ -84,14 +85,13 @@ def check_hpb_env_vars():
 		)
 
 
-#: Everything the bridge needs to talk to Korsi. All five, because there is no useful partial state:
+#: Everything the bridge needs to talk to Korsi. All four, because there is no useful partial state:
 #: without any one of them the bridge cannot ask which rooms to watch, and therefore does nothing.
 KORSI_REQUIRED_VARS = (
 	"KORSI_API_URL",
 	"KORSI_TOKEN_URL",
-	"KORSI_CLIENT_ID",
-	"KORSI_CLIENT_SECRET",
 	"KORSI_TOKEN_SCOPE",
+	"KORSI_SERVICE_KEY",
 )
 
 
@@ -109,6 +109,25 @@ def check_korsi_env_vars() -> list[str]:
 	token_url = os.getenv("KORSI_TOKEN_URL")
 	if token_url and not urlparse(token_url).hostname:
 		missing.append("KORSI_TOKEN_URL (not a valid URL)")
+
+	# Checked for shape here as well as at construction, so a pasting accident is reported by
+	# the status endpoint and by the enable handler rather than only in a stack trace.
+	service_key = os.getenv("KORSI_SERVICE_KEY")
+	if service_key:
+		try:
+			parsed = json.loads(service_key)
+		except json.JSONDecodeError:
+			missing.append("KORSI_SERVICE_KEY (not valid JSON)")
+		else:
+			absent = [f for f in ("keyId", "userId", "key") if not parsed.get(f)]
+			if absent:
+				missing.append(f"KORSI_SERVICE_KEY (missing {', '.join(absent)})")
+
+	# The roles assertion is the one reserved scope whose absence produces a working token that
+	# is refused by korsi-api for an unrelated-looking reason. Worth naming before that happens.
+	scope = os.getenv("KORSI_TOKEN_SCOPE")
+	if scope and "urn:zitadel:iam:org:projects:roles" not in scope:
+		missing.append("KORSI_TOKEN_SCOPE (missing the projects:roles scope)")
 
 	return missing
 

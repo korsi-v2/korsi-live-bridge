@@ -64,19 +64,14 @@ IMPORTANT: The environment variables below must be set in "Deploy Options", next
 				<description>OAuth2 token endpoint of Korsi's identity provider, for example "https://auth.korsi.ai/oauth/v2/token". The bridge exchanges its client credentials here for an access token.</description>
 			</variable>
 			<variable>
-				<name>KORSI_CLIENT_ID</name>
-				<display-name>Korsi client ID</display-name>
-				<description>Client ID of the machine account Korsi created for this Nextcloud. It grants only the two permissions the bridge needs: reading which rooms to watch, and posting transcript.</description>
-			</variable>
-			<variable>
-				<name>KORSI_CLIENT_SECRET</name>
-				<display-name>Korsi client secret</display-name>
-				<description>Client secret of that machine account. Provided once by Korsi when the bridge is registered.</description>
-			</variable>
-			<variable>
 				<name>KORSI_TOKEN_SCOPE</name>
 				<display-name>Korsi token scope</display-name>
-				<description>The exact scope string Korsi provided. It contains an audience identifier that addresses the token to the Korsi API, so it must be pasted verbatim — a token requested without it is accepted by the identity provider and then rejected by Korsi.</description>
+				<description>The exact scope string Korsi provided, pasted verbatim. It carries three identifiers the token cannot work without: the Korsi API audience, the project-roles assertion, and this organization. Edited or shortened, the identity provider still issues a token and Korsi refuses every request.</description>
+			</variable>
+			<variable>
+				<name>KORSI_SERVICE_KEY</name>
+				<display-name>Korsi service key</display-name>
+				<description>The JSON key document Korsi provided, on a single line. The bridge signs a short-lived assertion with it to obtain access tokens, so the private key never leaves this server. Korsi cannot show it again — ask for a new one if it is lost.</description>
 			</variable>
 			<variable>
 				<name>SKIP_CERT_VERIFY</name>

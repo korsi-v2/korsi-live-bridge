@@ -13,6 +13,9 @@ nc_py_api>=0.24.0
 niquests
 numpy
 pydantic
+# RS256 for the JWT-profile assertion. `cryptography` is what PyJWT needs to sign it, and is
+# not pulled in by the bare package.
+pyjwt[crypto]
 ruamel.yaml
 # no pypi release since a long time
 supervisor @ git+https://github.com/Supervisor/supervisor.git@7b4190831a5162f5b26a72a039770ad4dfb5f6a2

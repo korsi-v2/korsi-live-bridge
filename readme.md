@@ -66,12 +66,19 @@ enable without them rather than starting up and silently recording nothing.
 | `LT_INTERNAL_SECRET` | the HPB's `internalsecret`, not Talk's shared secret |
 | `KORSI_API_URL` | e.g. `https://api.korsi.ai` |
 | `KORSI_TOKEN_URL` | Korsi's OAuth2 token endpoint |
-| `KORSI_CLIENT_ID` / `KORSI_CLIENT_SECRET` | the machine account Korsi issued for this Nextcloud |
 | `KORSI_TOKEN_SCOPE` | the scope string Korsi provided, **verbatim** |
+| `KORSI_SERVICE_KEY` | the JSON key document Korsi provided, on one line |
 
-`KORSI_TOKEN_SCOPE` carries an audience identifier that addresses the token to korsi-api. Composed by
-hand and it will look right and fail: the identity provider issues the token, and Korsi rejects every
-call as unauthorized because the roles arrived in a claim it does not read.
+Run `make provision-bridge slug=<tenant>` in korsi-api to get all four. Do not compose them by hand.
+
+`KORSI_TOKEN_SCOPE` carries three ZITADEL reserved URNs: the korsi-api audience, the project-roles
+assertion, and the acting organization. Drop any one and the identity provider still issues a valid,
+correctly signed token that Korsi refuses — for a reason that looks nothing like a missing scope.
+
+Authentication is the JWT-profile grant, not client credentials, and that is forced rather than chosen:
+ZITADEL does not assert project roles into a `client_credentials` token, so such a token reaches
+korsi-api with no roles and no permissions. The upside is that the private key never leaves this
+container.
 
 There is no speech-provider key here. Korsi mints a session-scoped temporary one per call, so no
 long-lived Korsi credential sits in customer infrastructure.
