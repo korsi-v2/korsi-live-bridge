@@ -33,9 +33,9 @@ doc: the bridge holds no policy.
 """
 
 import asyncio
-import json
 import logging
 import os
+import re
 import time
 from datetime import UTC, datetime
 from typing import Any
@@ -51,6 +51,7 @@ from korsi_types import (
 	LiveSttCredential,
 	LiveWatchlist,
 )
+from service_key import load_service_key
 
 LOGGER = logging.getLogger("lt")
 
@@ -64,6 +65,11 @@ REQUEST_TIMEOUT_SECONDS = 30
 
 #: korsi-api error codes the bridge treats specially rather than as "some failure".
 _SESSION_GONE_CODES = frozenset({"live.session_closed", "live.session_not_found"})
+
+#: How ZITADEL names an asserted-roles claim, both in its all-projects and its per-project form. The
+#: project id in the middle is not something the bridge knows or needs to know: any claim shaped like
+#: this carries role keys, and their presence is the whole question.
+_ROLES_CLAIM = re.compile(r"^urn:zitadel:iam:org:project:(?:[^:]+:)?roles$")
 
 
 def _status_of(response: Any) -> int:
@@ -89,17 +95,22 @@ class KorsiClient:
 		self._token_url = os.environ["KORSI_TOKEN_URL"]
 		self._scope = os.environ["KORSI_TOKEN_SCOPE"]
 
-		# The service key ZITADEL generated, as the JSON document `provision-bridge` printed.
-		# Parsed at construction so a malformed value fails when the app is enabled rather
-		# than in the middle of the first call somebody cared about.
-		key = json.loads(os.environ["KORSI_SERVICE_KEY"])
-		try:
-			self._key_id: str = key["keyId"]
-			self._user_id: str = key["userId"]
-			self._private_key: str = key["key"]
-		except KeyError as exc:
-			msg = f"KORSI_SERVICE_KEY is missing {exc}; paste the value provision-bridge printed"
-			raise ValueError(msg) from exc
+		# The service key ZITADEL generated, as either the JSON document `provision-bridge` printed or
+		# base64 of it. Parsed *and test-signed* at construction, so a value the deployment layer
+		# mangled fails when the app is enabled rather than in the middle of the first call somebody
+		# cared about. See `service_key` for why that is not paranoia.
+		key = load_service_key(os.environ["KORSI_SERVICE_KEY"])
+		self._key_id: str = key.key_id
+		self._user_id: str = key.user_id
+		self._private_key: str = key.private_key
+		if key.repairs:
+			# Warned about rather than passed over silently: a value that needed repair will arrive
+			# damaged again on the next deploy, and the operator can stop that by switching to base64.
+			LOGGER.warning(
+				"KORSI_SERVICE_KEY arrived damaged and was repaired to make it usable."
+				" Set it as base64 to stop the deployment layer from mangling it.",
+				extra={"repairs": list(key.repairs), "encoding": key.encoding, "tag": "korsi"},
+			)
 
 		#: The assertion's audience is the identity provider, not korsi-api: it is addressed to
 		#: whoever will exchange it, and the token that comes back is what carries korsi-api's
@@ -203,6 +214,37 @@ class KorsiClient:
 		"""
 		self._token = None
 		self._token_expires_at = 0.0
+
+	async def fresh_token_claims(self) -> dict[str, Any]:
+		"""Mint a token and report what it asserts, without returning the token itself.
+
+		This exists because of the failure that cost the most to diagnose and is invisible from every
+		other vantage point: a token can be issued, correctly signed, correctly addressed to korsi-api,
+		and carry no roles at all -- at which point korsi-api refuses every call as forbidden and
+		nothing in the refusal mentions roles or scopes. Decoding the token this bridge would actually
+		use settles that in one line, so an administrator does not have to distinguish "the credential
+		is wrong" from "the scope is wrong" by trying things.
+
+		Signature verification is skipped on purpose. The issuer produced this token seconds ago, the
+		bridge is not a resource server for it, and fetching JWKS to check it would add a second thing
+		that can fail while diagnosing the first.
+		"""
+		self.forget_token()
+		token = await self._bearer()
+		claims = pyjwt.decode(token, options={"verify_signature": False})
+
+		roles: list[str] = []
+		for name, value in claims.items():
+			if _ROLES_CLAIM.match(name) and isinstance(value, dict):
+				roles.extend(str(role) for role in value)
+
+		audience = claims.get("aud")
+		return {
+			"subject": claims.get("sub"),
+			"audience": audience if isinstance(audience, list) else [audience],
+			"expires_at": claims.get("exp"),
+			"roles": sorted(set(roles)),
+		}
 
 	# ------------------------------------------------------------------ transport
 

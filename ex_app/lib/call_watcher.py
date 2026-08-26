@@ -132,8 +132,9 @@ class CallWatcher:
 						# ceiling immediately instead of retrying every thirty seconds forever: the
 						# fix is a deployment change, and the logs should say so once an hour.
 						LOGGER.error(
-							"Korsi rejected this bridge's credentials. Check KORSI_CLIENT_ID,"
-							" KORSI_CLIENT_SECRET and KORSI_TOKEN_SCOPE.",
+							"Korsi rejected this bridge's credentials. Check KORSI_SERVICE_KEY and"
+							" KORSI_TOKEN_SCOPE, and read the bridge's self-test for which of the"
+							" two is at fault.",
 							exc_info=e, extra={"tag": "watcher"},
 						)
 						backoff = WATCHLIST_MAX_BACKOFF_SECONDS

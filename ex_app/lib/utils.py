@@ -5,7 +5,6 @@
 
 import hashlib
 import hmac
-import json
 import logging
 import os
 import re
@@ -19,6 +18,7 @@ from urllib.parse import urlparse
 from constants import CACHE_TTL
 from livetypes import HPBSettings
 from nc_py_api import NextcloudApp
+from service_key import ServiceKeyError, load_service_key
 
 LOGGER = logging.getLogger("lt.utils")
 
@@ -96,9 +96,9 @@ KORSI_REQUIRED_VARS = (
 
 
 def check_korsi_env_vars() -> list[str]:
-	"""Which Korsi settings are missing.
+	"""What is wrong with the Korsi settings, as a list of problems an operator can act on.
 
-	Returns names rather than raising, and names rather than values: two of these are secrets, and this
+	Returns descriptions rather than raising, and never a value: two of these are secrets, and this
 	result is rendered into the Nextcloud admin UI and into a status endpoint.
 	"""
 	missing = [var for var in KORSI_REQUIRED_VARS if not os.getenv(var)]
@@ -110,26 +110,15 @@ def check_korsi_env_vars() -> list[str]:
 	if token_url and not urlparse(token_url).hostname:
 		missing.append("KORSI_TOKEN_URL (not a valid URL)")
 
-	# Checked for shape here as well as at construction, so a pasting accident is reported by
-	# the status endpoint and by the enable handler rather than only in a stack trace.
+	# Fully loaded and test-signed here as well as at construction, so a value the deployment layer
+	# damaged is named by the status endpoint and by the enable handler -- which is where somebody is
+	# looking -- rather than only by a signing error during the first meeting.
 	service_key = os.getenv("KORSI_SERVICE_KEY")
 	if service_key:
 		try:
-			parsed = json.loads(service_key)
-		except json.JSONDecodeError:
-			missing.append("KORSI_SERVICE_KEY (not valid JSON)")
-		else:
-			absent = [f for f in ("keyId", "userId", "key") if not parsed.get(f)]
-			if absent:
-				missing.append(f"KORSI_SERVICE_KEY (missing {', '.join(absent)})")
-			# Truncation is the realistic pasting accident: the key is a multi-line PEM being
-			# put into a single-line form field. Checking both markers catches a value that
-			# has the right fields and half a key, which otherwise fails at the first token
-			# request rather than when the app is enabled.
-			elif not (
-				"-----BEGIN" in parsed["key"] and "-----END" in parsed["key"]
-			):
-				missing.append("KORSI_SERVICE_KEY (the key looks truncated)")
+			load_service_key(service_key)
+		except ServiceKeyError as e:
+			missing.append(str(e))
 
 	# The roles assertion is the one reserved scope whose absence produces a working token that
 	# is refused by korsi-api for an unrelated-looking reason. Worth naming before that happens.

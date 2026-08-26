@@ -62,6 +62,10 @@ class Application:
 				f"Korsi is not configured: environment variable {e} is missing. The bridge cannot"
 				" ask Korsi which rooms to watch."
 			) from e
+		except ValueError as e:
+			# A setting that is present and unusable, which is a different problem from a missing one
+			# and has a different fix: usually the deployment layer damaged a multi-line value.
+			raise SpreedClientException(f"Korsi is not configured: {e}") from e
 
 		self._watcher = CallWatcher(korsi=self._korsi)
 		self._watcher.start(self.hpb_settings)

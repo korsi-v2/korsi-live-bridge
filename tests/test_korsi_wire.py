@@ -309,7 +309,7 @@ async def test_missing_roles_scope_is_named_before_it_causes_a_refusal(monkeypat
 	for name, value in {
 		"KORSI_API_URL": "https://api.example.test",
 		"KORSI_TOKEN_URL": "https://auth.example.test/oauth/v2/token",
-		"KORSI_SERVICE_KEY": json.dumps({"keyId": "k", "userId": "u", "key": "x"}),
+		"KORSI_SERVICE_KEY": json.dumps({"keyId": "k", "userId": "u", "key": _TEST_KEY}),
 		"KORSI_TOKEN_SCOPE": "openid urn:zitadel:iam:org:project:id:x:aud",
 	}.items():
 		monkeypatch.setenv(name, value)

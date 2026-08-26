@@ -67,13 +67,20 @@ enable without them rather than starting up and silently recording nothing.
 | `KORSI_API_URL` | e.g. `https://api.korsi.ai` |
 | `KORSI_TOKEN_URL` | Korsi's OAuth2 token endpoint |
 | `KORSI_TOKEN_SCOPE` | the scope string Korsi provided, **verbatim** |
-| `KORSI_SERVICE_KEY` | the JSON key document Korsi provided, on one line |
+| `KORSI_SERVICE_KEY` | the key Korsi provided — **paste the base64 form** |
 
 Run `make provision-bridge slug=<tenant>` in korsi-api to get all four. Do not compose them by hand.
 
 `KORSI_TOKEN_SCOPE` carries three ZITADEL reserved URNs: the korsi-api audience, the project-roles
 assertion, and the acting organization. Drop any one and the identity provider still issues a valid,
 correctly signed token that Korsi refuses — for a reason that looks nothing like a missing scope.
+
+`KORSI_SERVICE_KEY` is a JSON document wrapping a multi-line PEM, and deployment platforms damage it.
+Coolify escapes the backslashes, which leaves valid JSON, all three fields, both PEM markers, and every
+line break inside the key turned into the two characters `\` and `n` — a key `cryptography` refuses.
+`provision-bridge` therefore prints the value base64-encoded, and that is the form to paste: no quotes,
+no braces, no backslashes, no line breaks, nothing to escape. Raw JSON is still accepted, repaired
+where the damage is recoverable, and the repair is reported on the admin page.
 
 Authentication is the JWT-profile grant, not client credentials, and that is forced rather than chosen:
 ZITADEL does not assert project roles into a `client_credentials` token, so such a token reaches
@@ -83,9 +90,28 @@ container.
 There is no speech-provider key here. Korsi mints a session-scoped temporary one per call, so no
 long-lived Korsi credential sits in customer infrastructure.
 
-`GET /api/v1/status` reports whether the bridge is watching and which rooms it was given — the way to
-tell a working bridge waiting for a meeting from a misconfigured one. It names missing settings, never
-their values.
+## Diagnosing it
+
+Nothing appears in Talk when this app is working, so "no live analysis" has no visible cause. There is
+an **admin page** for that: it appears in Nextcloud's app menu as *Korsi live bridge*, for
+administrators only.
+
+It runs a self-test — every step between "the app is enabled" and "Korsi is listening", each reported
+separately, stopping at the first failure that makes the rest meaningless — then shows what the bridge
+is doing and tails its log. The steps are also reachable directly, through AppAPI's proxy:
+
+| endpoint | what it answers |
+|---|---|
+| `POST /api/v1/selftest` | which of the seven possible causes it actually is |
+| `GET /api/v1/status` | is it watching, and which rooms was it given |
+| `GET /api/v1/logs` | recent log records, without needing the Docker socket |
+
+The self-test decodes the access token it would use and reports the roles in it. That matters more than
+it sounds: a token with no roles is issued successfully, is correctly signed and addressed, and is then
+refused by Korsi for a reason that mentions neither roles nor scopes.
+
+Values are never returned — not the service key, not the internal secret. The key is reported by its
+`keyId` and machine user, which are not secret and are what confirm the right credential landed.
 
 ## Development
 
