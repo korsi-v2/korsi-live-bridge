@@ -90,6 +90,30 @@ container.
 There is no speech-provider key here. Korsi mints a session-scoped temporary one per call, so no
 long-lived Korsi credential sits in customer infrastructure.
 
+### Optional, and only when the network needs it
+
+| variable | what it is |
+|---|---|
+| `KORSI_ICE_STUN_URLS` | comma-separated, e.g. `stun:talk:3478` |
+| `KORSI_ICE_TURN_URLS` | comma-separated, e.g. `turn:talk:3478?transport=udp` |
+| `KORSI_LOG_LEVEL` | `DEBUG` to see the SDP and the signaling traffic |
+
+Talk hands this bridge the ICE servers it hands browsers: public host names. That is right for a
+participant on the internet and can be wrong for a container beside Nextcloud — if the public name
+resolves to a reverse proxy in front of the host, a STUN request comes back reflecting the Docker
+gateway and a TURN allocation does not come back at all. The bridge then joins the call, gathers only
+private candidates, fails its connectivity checks after about a minute, and mixes silence.
+
+Set these to reach the same servers on the container network. Only the URLs change: the credential still
+comes from Talk, which mints it with the TURN REST scheme — an HMAC over an expiry, carrying no host and
+no realm — so it is valid at that server under any name. There is no secret to configure here, and
+nothing to rotate when Talk's changes.
+
+`KORSI_ICE_TURN_URLS` cannot stand in for TURN that Talk does not have: with no entry from Talk there is
+no credential to send. Run `occ talk:turn:add` first. The admin page's status shows both lists and where
+each came from, and the self-test fails on a missing relay path rather than leaving it to be inferred
+from a silent meeting.
+
 ## Diagnosing it
 
 Nothing appears in Talk when this app is working, so "no live analysis" has no visible cause. There is

@@ -11,6 +11,7 @@ import logging.config
 import logging.handlers
 import os
 import traceback
+from contextlib import suppress
 from time import gmtime
 from typing import Literal
 
@@ -119,11 +120,34 @@ class JSONFormatter(logging.Formatter):
 		return message
 
 
+#: Raises the bridge's own log level without rebuilding the image. The bridge runs in a customer's
+#: infrastructure, and every diagnostic that is only available at DEBUG otherwise costs a new image, a
+#: registry push and a redeploy before anybody can read it. Accepts the standard level names; anything
+#: else is ignored in favour of what the file says, because a typo here should not silence the log.
+LOG_LEVEL_VAR = "KORSI_LOG_LEVEL"
+
+_LOG_LEVELS = ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL")
+
+
+def _apply_log_level(config: dict) -> None:
+	level = (os.getenv(LOG_LEVEL_VAR) or "").strip().upper()
+	if level not in _LOG_LEVELS:
+		return
+	# The logger's own level and the stderr handler's, because either one left at INFO drops DEBUG
+	# records before the other sees them. The file handler is already at DEBUG and stays there: it is
+	# what `/api/v1/logs` reads, and it is capped and rotated.
+	with suppress(KeyError, TypeError):
+		config["loggers"]["lt"]["level"] = level
+	with suppress(KeyError, TypeError):
+		config["handlers"]["stderr"]["level"] = level
+
+
 def get_logging_config(config_path: str) -> dict:
 	with open(config_path) as f:
 		try:
 			yaml = YAML(typ="safe")
 			config: dict = yaml.load(f)
+			_apply_log_level(config)
 
 			persistent_storage = os.getenv("APP_PERSISTENT_STORAGE", "persistent_storage")
 			if (config.get("handlers", {}).get("file_json", {}).get("filename")):

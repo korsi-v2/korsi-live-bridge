@@ -145,13 +145,26 @@
 
 	// ---------------------------------------------------------------- status
 
+	function iceRow (urls, source) {
+		if (!urls || !urls.length) {
+			return source ? 'none (' + source + ')' : 'none'
+		}
+		return urls.join(', ') + (source ? ' (from ' + source + ')' : '')
+	}
+
 	function renderStatus (into, status) {
+		// STUN and TURN are here rather than only in the self-test because they decide whether audio can
+		// arrive at all, and the failure they cause looks like success everywhere else: the call connects
+		// in Talk and reaches this container as silence.
+		var ice = status.ice || {}
 		var rows = [
 			['Enabled in Nextcloud', status.enabled ? 'yes' : 'no'],
 			['Watching for calls', status.watching ? 'yes' : 'no'],
 			['Talk signaling configured', status.hpb_configured ? 'yes' : 'no'],
 			['Version', status.version || '\u2014'],
 			['Watched conversations', (status.rooms && status.rooms.length) ? status.rooms.join(', ') : 'none'],
+			['STUN servers', iceRow(ice.stun, ice.stun_source)],
+			['TURN servers', iceRow(ice.turn, ice.turn_source)],
 		]
 		var table = element('table', { class: 'korsi-kv' })
 		rows.forEach(function (row) {

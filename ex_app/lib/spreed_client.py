@@ -17,7 +17,7 @@ from typing import Any
 from urllib.parse import urlparse
 
 from aiortc import RTCPeerConnection, RTCSessionDescription
-from aiortc.rtcconfiguration import RTCConfiguration, RTCIceServer
+from aiortc.rtcconfiguration import RTCConfiguration
 from aiortc.sdp import candidate_from_sdp
 from audio_mixer import AudioMixer
 from audio_stream import AudioStream
@@ -27,6 +27,7 @@ from constants import (
 	ICE_GATHERING_TIMEOUT,
 	MSG_RECEIVE_TIMEOUT,
 )
+from ice_config import resolve_ice_servers
 from korsi_client import KorsiClient
 from korsi_types import LiveCloseReason, LiveSessionOpened, LiveSttCredential
 from livetypes import (
@@ -47,6 +48,49 @@ from websockets.exceptions import WebSocketException
 
 LOGGER = logging.getLogger("lt.spreed_client")
 
+#: How many outgoing messages to remember by id, so an error the HPB reports can be attributed. One
+#: offer costs an answer plus a candidate per gathered candidate, so this holds several participants'
+#: worth. Bounded because it is keyed by a counter that only goes up, for the length of a call.
+SENT_SUMMARY_HISTORY = 64
+
+
+#: The candidate types SDP defines (RFC 8445). Matched against, rather than trusting whatever token
+#: follows `typ`, because this reads a line that arrives from the network and the result is used as a
+#: log label -- and a line where the word appears anywhere else would otherwise report a made-up type.
+CANDIDATE_TYPES = frozenset({"host", "srflx", "prflx", "relay"})
+
+
+def _candidate_type(candidate: str) -> str:
+	"""The `typ` field of an SDP candidate line: host, srflx, prflx or relay."""
+	parts = candidate.split()
+	with suppress(ValueError, IndexError):
+		found = parts[parts.index("typ") + 1]
+		if found in CANDIDATE_TYPES:
+			return found
+	return "unknown"
+
+
+def _summarize_sent(message: dict) -> dict:
+	"""Enough of an outgoing message to identify it later, and nothing that cannot be logged.
+
+	Deliberately not the message. SDP and candidate lines are large and go to a file an administrator
+	can read over HTTP; what is needed to act on an error is which kind of message it was and who it
+	was for.
+	"""
+	envelope = message.get("message")
+	envelope = envelope if isinstance(envelope, dict) else {}
+	data = envelope.get("data")
+	data = data if isinstance(data, dict) else {}
+	recipient = envelope.get("recipient")
+	recipient = recipient if isinstance(recipient, dict) else {}
+
+	summary = {"type": message.get("type")}
+	if data.get("type"):
+		summary["data_type"] = data["type"]
+	if recipient.get("sessionid"):
+		summary["recipient"] = recipient["sessionid"]
+	return summary
+
 
 @dataclasses.dataclass
 class PeerConnection:
@@ -66,6 +110,7 @@ class SpreedClient:
 		on_call_ended: Callable[[str, LiveCloseReason], Coroutine[Any, Any, None]],
 	) -> None:
 		self.id = 0
+		self._sent_summaries: dict[str, dict] = {}
 		self._server: ClientConnection | None = None
 		self._monitor: asyncio.Task | None = None
 		self.peer_connections: dict[str, PeerConnection] = {}
@@ -607,6 +652,11 @@ class SpreedClient:
 
 		self.id += 1
 		message["id"] = str(self.id)
+		# Kept so that an error the HPB reports by id can name the message that caused it. Without this
+		# the two halves of the story are a DEBUG line and an ERROR line that only a human comparing
+		# counters can join, and the DEBUG half is not in the log at the level this runs at.
+		self._sent_summaries[message["id"]] = _summarize_sent(message)
+		self._sent_summaries.pop(str(self.id - SENT_SUMMARY_HISTORY), None)
 		try:
 			await self._server.send(json.dumps(message))
 		except WebSocketException as e:
@@ -875,6 +925,7 @@ class SpreedClient:
 				break
 
 			if message.get("type") == "error":
+				failed = self._sent_summaries.get(str(message.get("id")))
 				LOGGER.error(
 					"Error message received: %s\nDetails: %s",
 					message.get("error", {}).get("message"),
@@ -882,12 +933,31 @@ class SpreedClient:
 					extra={
 						"room_token": self.room_token,
 						"recv_message": message,
+						"failed_message": failed,
 						"tag": "monitor",
 					},
 				)
 				if message.get("error", {}).get("code") == "processing_failed":
-					# this is most probably related to a transcript reception failure on HPB side
-					# we can try to continue
+					# Upstream treats this as benign, and for upstream it is: what it sends over the
+					# signaling channel is transcript text to participants, and a dropped caption costs
+					# a caption. This fork sends its WebRTC answer and its ICE candidates over the same
+					# channel and nothing else, so the same code means the peer never learned how to
+					# reach us and the connection will spend a minute failing. Still not fatal to the
+					# client -- the room session has to survive to notice the next call -- but it is
+					# named for what it is, because a silent `continue` here is what a meeting with no
+					# audio looks like from the inside.
+					if failed and failed.get("data_type") in ("answer", "candidate"):
+						LOGGER.error(
+							"The HPB refused our %s, so the participant cannot complete the connection"
+							" and no audio will arrive from them. This is a signaling failure, not a"
+							" media one: check the HPB's own log for why it rejected the message.",
+							failed.get("data_type"),
+							extra={
+								"room_token": self.room_token,
+								"failed_message": failed,
+								"tag": "peer_connection",
+							},
+						)
 					continue
 				if message.get("error", {}).get("code") == "client_not_found":
 					# "No MCU client found to send message to."
@@ -1039,21 +1109,15 @@ class SpreedClient:
 				})
 				return
 
-		ice_servers = []
-		for stunserver in self.hpb_settings.stunservers:
-			ice_servers.append(
-				RTCIceServer(urls=stunserver.urls)
-			)
-		for turnserver in self.hpb_settings.turnservers:
-			ice_servers.append(
-				RTCIceServer(
-					urls=turnserver.urls,
-					username=turnserver.username,
-					credential=turnserver.credential,
-				)
-			)
-		if len(ice_servers) == 0:
-			ice_servers = None
+		# INFO, not DEBUG. This is the input that decides whether the connection can succeed at all, and
+		# it is unrecoverable after the fact -- a failed connection does not record what it tried.
+		ice_servers, ice_description = resolve_ice_servers(self.hpb_settings)
+		LOGGER.info("Gathering ICE candidates with these servers", extra={
+			"session_id": spkr_sid,
+			"room_token": self.room_token,
+			"tag": "peer_connection",
+			**ice_description,
+		})
 		rtc_config = RTCConfiguration(iceServers=ice_servers)
 		pc = RTCPeerConnection(configuration=rtc_config)
 		weakself = weakref.ref(self)
@@ -1168,4 +1232,13 @@ class SpreedClient:
 					line[2:],
 				)
 
-		LOGGER.info("Sent candidates to the peer", extra={ "candidates": candidates })
+		# The types, separately from the lines. What matters when a connection fails is which kinds were
+		# gathered -- `host` only means nothing outside this network can reach us, and no `relay` means
+		# TURN produced nothing -- and that is a question nobody should have to answer by reading SDP.
+		LOGGER.info("Sent candidates to the peer", extra={
+			"session_id": spkr_sid,
+			"room_token": self.room_token,
+			"candidate_types": sorted({_candidate_type(line) for line in candidates}),
+			"candidates": candidates,
+			"tag": "peer_connection",
+		})

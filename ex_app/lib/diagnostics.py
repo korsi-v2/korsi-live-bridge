@@ -27,6 +27,8 @@ from collections import deque
 from pathlib import Path
 from typing import Any
 
+from ice_config import TURN_URLS_VAR
+from ice_config import describe as describe_ice
 from korsi_client import KorsiClient
 from korsi_types import KorsiApiError
 from service_key import describe
@@ -63,13 +65,14 @@ async def self_test() -> dict[str, Any]:
 		else "; ".join(problems),
 	))
 	if problems:
-		return _finish(checks, skipped=("talk_signaling", "korsi_token", "korsi_watchlist"))
+		return _finish(checks, skipped=("talk_signaling", "ice_servers", "korsi_token", "korsi_watchlist"))
 
 	# In a thread because it is a synchronous OCS round trip to Nextcloud, and this is running on the
 	# event loop that is also pumping a call's audio.
 	try:
 		settings = await asyncio.to_thread(get_hpb_settings)
 		checks.append(_check("talk_signaling", True, f"Talk's high performance backend is at {settings.server}"))
+		checks.append(_ice_check(settings))
 	except Exception as e:  # noqa: BLE001 - every failure here is reported, none is escalated
 		checks.append(_check(
 			"talk_signaling",
@@ -77,6 +80,7 @@ async def self_test() -> dict[str, Any]:
 			f"could not read Talk's signaling settings: {e}."
 			" Talk needs a high performance backend before any call can be read.",
 		))
+		checks.append(_check("ice_servers", None, "not attempted: Talk's signaling settings are unreadable"))
 
 	client: KorsiClient | None = None
 	try:
@@ -164,6 +168,36 @@ async def _korsi_checks(client: KorsiClient) -> list[dict[str, Any]]:
 		details={"rooms": [room.room_remote_id for room in watchlist.rooms]},
 	))
 	return checks
+
+
+def _ice_check(settings: Any) -> dict[str, Any]:
+	"""Whether a participant's browser will be able to reach this container at all.
+
+	Its own step rather than a note on the signaling check, because it fails for its own reason and has
+	its own fix, and because it is invisible in every other symptom: a bridge with no relay path joins
+	the call, reports itself healthy, mixes silence, and posts empty transcript segments.
+
+	No TURN counts as a failure here even though WebRTC does not strictly require it. This peer is a
+	container on a private network and the participants are browsers on the internet; without a relay
+	candidate the only ones that can connect are the ones that could already route to a Docker address.
+	"""
+	ice = describe_ice(settings)
+	if ice["turn"]:
+		return _check(
+			"ice_servers",
+			True,
+			f"a relay path is available via {', '.join(ice['turn'])} (from {ice['turn_source']})",
+			details={"ice": ice},
+		)
+	return _check(
+		"ice_servers",
+		False,
+		"Talk offers this bridge no TURN server, so a participant's browser has no way to reach a"
+		" container on a private network. The call will connect in Talk and arrive here as silence."
+		" Configure TURN in Talk (occ talk:turn:add), and if its host name does not resolve to this"
+		f" machine from inside the container, set {TURN_URLS_VAR} to reach it on the container network.",
+		details={"ice": ice},
+	)
 
 
 def _check(name: str, ok: bool | None, detail: str, *, details: dict[str, Any] | None = None) -> dict[str, Any]:

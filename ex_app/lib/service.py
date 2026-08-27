@@ -15,6 +15,7 @@ it does not -- and a status read for the admin who wants to know whether any of 
 import logging
 
 from call_watcher import CallWatcher
+from ice_config import describe as describe_ice
 from korsi_client import KorsiClient
 from livetypes import HPBSettings, SpreedClientException
 from utils import get_hpb_settings
@@ -92,4 +93,7 @@ class Application:
 			"watching": self.running,
 			"rooms": self._watcher.watched_rooms if self._watcher else [],
 			"hpb_configured": self.hpb_settings is not None,
+			# Readable before a meeting rather than only inferable from one that failed. A bridge with no
+			# TURN server will accept a call, join it, and gather nothing anybody can reach.
+			"ice": describe_ice(self.hpb_settings),
 		}
