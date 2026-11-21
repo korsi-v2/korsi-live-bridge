@@ -9,7 +9,7 @@
 aiortc
 av
 dotenv
-nc_py_api>=0.24.0
+nc_py_api>=0.31.0
 niquests
 numpy
 pydantic
